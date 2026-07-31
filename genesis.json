@@ -1,0 +1,61 @@
+{
+  "chain_id": "eastchain-1",
+  "genesis_time": 0,
+  "total_max_supply": 1000000000,
+  "min_validator_stake": 100,
+  "chain_signing_address": "",
+  "buckets": [
+    {
+      "name": "mining",
+      "cap": 300000000,
+      "minted": 0
+    },
+    {
+      "name": "staking",
+      "cap": 80000000,
+      "minted": 0
+    },
+    {
+      "name": "validator",
+      "cap": 80000000,
+      "minted": 0
+    },
+    {
+      "name": "campaign",
+      "cap": 40000000,
+      "minted": 0
+    },
+    {
+      "name": "liquidity",
+      "cap": 150000000,
+      "minted": 0
+    },
+    {
+      "name": "treasury",
+      "cap": 100000000,
+      "minted": 0
+    },
+    {
+      "name": "emergency",
+      "cap": 70000000,
+      "minted": 0
+    },
+    {
+      "name": "marketing",
+      "cap": 70000000,
+      "minted": 0
+    },
+    {
+      "name": "team",
+      "cap": 60000000,
+      "minted": 0
+    },
+    {
+      "name": "founder",
+      "cap": 50000000,
+      "minted": 0
+    }
+  ],
+  "accounts": [],
+  "min_fullnode_stake": 10
+}

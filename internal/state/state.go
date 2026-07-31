@@ -1,0 +1,379 @@
+package state
+
+import (
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+	"sync"
+	"time"
+
+	"github.com/dgraph-io/badger/v4"
+	"github.com/rs/zerolog/log"
+
+	"github.com/eastchain/east-validator/internal/genesis"
+	"github.com/eastchain/east-validator/internal/tx"
+)
+
+type Account struct {
+	Balance        int64  `json:"balance"`
+	Staked         int64  `json:"staked"`
+	PendingUnstake int64  `json:"pending_unstake"`
+	Nonce          uint64 `json:"nonce"`
+}
+
+type BlockHeader struct {
+	Height    uint64   `json:"height"`
+	Hash      string   `json:"hash"`
+	PrevHash  string   `json:"prev_hash"`
+	StateRoot string   `json:"state_root"`
+	TxHashes  []string `json:"tx_hashes"`
+	Timestamp int64    `json:"timestamp"`
+	Proposer  string   `json:"proposer"`
+	TxCount   int      `json:"tx_count"`
+	Signature string   `json:"signature,omitempty"`
+}
+
+type Store struct {
+	db   *badger.DB
+	mu   sync.RWMutex
+	path string
+
+	totalMaxSupply    int64
+	minValidatorStake int64
+	chainSigningAddr  string
+}
+
+func Open(dataDir string) (*Store, error) {
+	if err := os.MkdirAll(dataDir, 0o755); err != nil {
+		return nil, err
+	}
+	opts := badger.DefaultOptions(filepath.Join(dataDir, "badger"))
+	opts.Logger = nil
+	db, err := badger.Open(opts)
+	if err != nil {
+		return nil, fmt.Errorf("open badger: %w", err)
+	}
+	s := &Store{db: db, path: dataDir}
+	log.Info().Str("path", dataDir).Msg("local state opened")
+	return s, nil
+}
+
+func (s *Store) Close() error { return s.db.Close() }
+
+func (s *Store) InitGenesis(g *genesis.Genesis) error {
+	if err := g.Validate(); err != nil {
+		return err
+	}
+	return s.db.Update(func(txn *badger.Txn) error {
+		if _, err := txn.Get(metaKey("genesis_hash")); err == nil {
+			log.Info().Msg("genesis already applied — skipping")
+			s.totalMaxSupply = g.TotalMaxSupply
+			s.minValidatorStake = g.MinValidatorStake
+			s.chainSigningAddr = g.ChainSigningAddress
+			return nil
+		}
+
+		for _, b := range g.Buckets {
+			val, _ := json.Marshal(b)
+			if err := txn.Set(bucketKey(b.Name), val); err != nil {
+				return err
+			}
+		}
+		for _, a := range g.Accounts {
+			acc := Account{Balance: a.Balance, Staked: a.Staked}
+			val, _ := json.Marshal(acc)
+			if err := txn.Set(accountKey(a.Address), val); err != nil {
+				return err
+			}
+		}
+
+		meta, _ := json.Marshal(map[string]any{
+			"chain_id":              g.ChainID,
+			"genesis_time":          g.GenesisTime,
+			"total_max_supply":      g.TotalMaxSupply,
+			"min_validator_stake":   g.MinValidatorStake,
+			"chain_signing_address": g.ChainSigningAddress,
+		})
+		if err := txn.Set(metaKey("genesis"), meta); err != nil {
+			return err
+		}
+		if err := txn.Set(metaKey("genesis_hash"), []byte("applied")); err != nil {
+			return err
+		}
+		if err := txn.Set(metaKey("latest_height"), []byte("0")); err != nil {
+			return err
+		}
+
+		s.totalMaxSupply = g.TotalMaxSupply
+		s.minValidatorStake = g.MinValidatorStake
+		s.chainSigningAddr = g.ChainSigningAddress
+		log.Info().
+			Int64("max_supply", g.TotalMaxSupply).
+			Int("buckets", len(g.Buckets)).
+			Int("accounts", len(g.Accounts)).
+			Msg("genesis applied")
+		return nil
+	})
+}
+
+func (s *Store) TotalMaxSupply() int64       { return s.totalMaxSupply }
+func (s *Store) MinValidatorStake() int64    { return s.minValidatorStake }
+func (s *Store) ChainSigningAddress() string { return s.chainSigningAddr }
+
+func accountKey(addr string) []byte { return []byte("acc:" + addr) }
+func bucketKey(name string) []byte  { return []byte("bucket:" + name) }
+func blockKey(height uint64) []byte { return []byte(fmt.Sprintf("blk:%020d", height)) }
+func metaKey(key string) []byte     { return []byte("meta:" + key) }
+
+func (s *Store) GetAccount(addr string) (Account, error) {
+	var acc Account
+	err := s.db.View(func(txn *badger.Txn) error {
+		item, err := txn.Get(accountKey(addr))
+		if err == badger.ErrKeyNotFound {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		return item.Value(func(val []byte) error { return json.Unmarshal(val, &acc) })
+	})
+	return acc, err
+}
+
+func getAccountTxn(txn *badger.Txn, addr string) (Account, error) {
+	var acc Account
+	item, err := txn.Get(accountKey(addr))
+	if err == badger.ErrKeyNotFound {
+		return acc, nil
+	}
+	if err != nil {
+		return acc, err
+	}
+	err = item.Value(func(val []byte) error { return json.Unmarshal(val, &acc) })
+	return acc, err
+}
+
+func setAccountTxn(txn *badger.Txn, addr string, acc Account) error {
+	b, err := json.Marshal(acc)
+	if err != nil {
+		return err
+	}
+	return txn.Set(accountKey(addr), b)
+}
+
+func (s *Store) GetBucket(name string) (genesis.Bucket, error) {
+	var b genesis.Bucket
+	err := s.db.View(func(txn *badger.Txn) error {
+		item, err := txn.Get(bucketKey(name))
+		if err != nil {
+			return err
+		}
+		return item.Value(func(val []byte) error { return json.Unmarshal(val, &b) })
+	})
+	return b, err
+}
+
+func (s *Store) MintFromBucket(name string, amount int64) error {
+	if amount <= 0 {
+		return fmt.Errorf("mint amount must be > 0")
+	}
+	return s.db.Update(func(txn *badger.Txn) error {
+		item, err := txn.Get(bucketKey(name))
+		if err != nil {
+			return fmt.Errorf("bucket %s not found", name)
+		}
+		var b genesis.Bucket
+		if err := item.Value(func(val []byte) error { return json.Unmarshal(val, &b) }); err != nil {
+			return err
+		}
+		if b.Minted+amount > b.Cap {
+			return fmt.Errorf("bucket %s would exceed cap (%d/%d)", name, b.Minted+amount, b.Cap)
+		}
+		b.Minted += amount
+		val, _ := json.Marshal(b)
+		return txn.Set(bucketKey(name), val)
+	})
+}
+
+func (s *Store) ListBuckets() ([]genesis.Bucket, error) {
+	var out []genesis.Bucket
+	err := s.db.View(func(txn *badger.Txn) error {
+		opts := badger.DefaultIteratorOptions
+		it := txn.NewIterator(opts)
+		defer it.Close()
+		prefix := []byte("bucket:")
+		for it.Seek(prefix); it.ValidForPrefix(prefix); it.Next() {
+			var b genesis.Bucket
+			if err := it.Item().Value(func(val []byte) error { return json.Unmarshal(val, &b) }); err != nil {
+				return err
+			}
+			out = append(out, b)
+		}
+		return nil
+	})
+	return out, err
+}
+
+func (s *Store) ApplyTx(t *tx.Transaction) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return s.db.Update(func(txn *badger.Txn) error {
+		fromAcc, err := getAccountTxn(txn, t.From)
+		if err != nil {
+			return err
+		}
+		if t.Nonce > 0 && t.Nonce <= fromAcc.Nonce {
+			return fmt.Errorf("invalid nonce: got %d, current %d", t.Nonce, fromAcc.Nonce)
+		}
+
+		switch t.Type {
+		case tx.TxTransfer:
+			if fromAcc.Balance < t.Amount {
+				return fmt.Errorf("insufficient balance")
+			}
+			fromAcc.Balance -= t.Amount
+			fromAcc.Nonce = t.Nonce
+			toAcc, err := getAccountTxn(txn, t.To)
+			if err != nil {
+				return err
+			}
+			toAcc.Balance += t.Amount
+			if err := setAccountTxn(txn, t.From, fromAcc); err != nil {
+				return err
+			}
+			return setAccountTxn(txn, t.To, toAcc)
+
+		case tx.TxStake:
+			if fromAcc.Balance < t.Amount {
+				return fmt.Errorf("insufficient balance to stake")
+			}
+			fromAcc.Balance -= t.Amount
+			fromAcc.Staked += t.Amount
+			fromAcc.Nonce = t.Nonce
+			return setAccountTxn(txn, t.From, fromAcc)
+
+		case tx.TxRequestUnstake:
+			if fromAcc.Staked < t.Amount {
+				return fmt.Errorf("insufficient staked amount")
+			}
+			fromAcc.Staked -= t.Amount
+			fromAcc.PendingUnstake += t.Amount
+			fromAcc.Nonce = t.Nonce
+			return setAccountTxn(txn, t.From, fromAcc)
+
+		case tx.TxClaimUnstake:
+			if fromAcc.PendingUnstake < t.Amount {
+				return fmt.Errorf("insufficient pending unstake")
+			}
+			fromAcc.PendingUnstake -= t.Amount
+			fromAcc.Balance += t.Amount
+			fromAcc.Nonce = t.Nonce
+			return setAccountTxn(txn, t.From, fromAcc)
+
+		default:
+			return fmt.Errorf("unsupported tx type: %s", t.Type)
+		}
+	})
+}
+
+func (s *Store) SaveBlock(h BlockHeader) error {
+	return s.db.Update(func(txn *badger.Txn) error {
+		b, err := json.Marshal(h)
+		if err != nil {
+			return err
+		}
+		if err := txn.Set(blockKey(h.Height), b); err != nil {
+			return err
+		}
+		return txn.Set(metaKey("latest_height"), []byte(fmt.Sprintf("%d", h.Height)))
+	})
+}
+
+func (s *Store) GetLatestHeight() (uint64, error) {
+	var height uint64
+	err := s.db.View(func(txn *badger.Txn) error {
+		item, err := txn.Get(metaKey("latest_height"))
+		if err == badger.ErrKeyNotFound {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		return item.Value(func(val []byte) error {
+			_, err := fmt.Sscanf(string(val), "%d", &height)
+			return err
+		})
+	})
+	return height, err
+}
+
+func (s *Store) GetBlock(height uint64) (*BlockHeader, error) {
+	var h BlockHeader
+	err := s.db.View(func(txn *badger.Txn) error {
+		item, err := txn.Get(blockKey(height))
+		if err != nil {
+			return err
+		}
+		return item.Value(func(val []byte) error { return json.Unmarshal(val, &h) })
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &h, nil
+}
+
+func (s *Store) PruneOldBlocks(keep int) error {
+	if keep <= 0 {
+		return nil
+	}
+	latest, err := s.GetLatestHeight()
+	if err != nil || latest <= uint64(keep) {
+		return err
+	}
+	cutoff := latest - uint64(keep)
+	return s.db.Update(func(txn *badger.Txn) error {
+		opts := badger.DefaultIteratorOptions
+		opts.PrefetchValues = false
+		it := txn.NewIterator(opts)
+		defer it.Close()
+		prefix := []byte("blk:")
+		for it.Seek(prefix); it.ValidForPrefix(prefix); it.Next() {
+			key := it.Item().Key()
+			var height uint64
+			fmt.Sscanf(string(key), "blk:%d", &height)
+			if height < cutoff {
+				if err := txn.Delete(key); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	})
+}
+
+func (s *Store) SeedBalance(addr string, balance int64) error {
+	return s.db.Update(func(txn *badger.Txn) error {
+		acc, err := getAccountTxn(txn, addr)
+		if err != nil {
+			return err
+		}
+		acc.Balance = balance
+		return setAccountTxn(txn, addr, acc)
+	})
+}
+
+func (s *Store) Stats() map[string]any {
+	latest, _ := s.GetLatestHeight()
+	lsm, vlog := s.db.Size()
+	return map[string]any{
+		"latest_height":         latest,
+		"total_max_supply":      s.totalMaxSupply,
+		"min_validator_stake":   s.minValidatorStake,
+		"chain_signing_address": s.chainSigningAddr,
+		"lsm_size":              lsm,
+		"vlog_size":             vlog,
+		"time":                  time.Now().UTC().Format(time.RFC3339),
+	}
+}
