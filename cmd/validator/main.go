@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"time"
 	"syscall"
 
 	"github.com/rs/zerolog"
@@ -127,6 +128,10 @@ func main() {
 	var bft *consensus.BFTEngine
 	if bftEnabled {
 		bftCfg := consensus.DefaultBFTConfig()
+		bftCfg.MinBlockInterval = cfg.BlockInterval
+		if bftCfg.MinBlockInterval <= 0 {
+			bftCfg.MinBlockInterval = 120 * time.Second
+		}
 		bftCfg.Enabled = true
 		bft = consensus.NewBFTEngine(store, leader, bftCfg)
 		bft.SetMempool(pool)

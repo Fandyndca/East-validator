@@ -54,6 +54,10 @@ type BFTConfig struct {
 	PrecommitTimeout time.Duration
 	// RoundTimeoutDelta added per round number (linear backoff).
 	RoundTimeoutDelta time.Duration
+	// MinBlockInterval is the minimum wall-clock time between committed heights.
+	// Prevents solo/fast-quorum from sealing every few hundred ms.
+	// Defaults to BLOCK_INTERVAL_SEC (typically 120s) when wired from main.
+	MinBlockInterval time.Duration
 	// Enabled turns on full BFT. When false, falls back to immediate seal (legacy).
 	Enabled bool
 }
@@ -64,6 +68,7 @@ func DefaultBFTConfig() BFTConfig {
 		PrevoteTimeout:    2 * time.Second,
 		PrecommitTimeout:  2 * time.Second,
 		RoundTimeoutDelta: 1 * time.Second,
+		MinBlockInterval:  120 * time.Second,
 		Enabled:           true,
 	}
 }
@@ -112,7 +117,8 @@ type BFTEngine struct {
 	// Double-sign detection: voter → last signed (height, round, type, hash)
 	lastVotes map[string]voteKey
 
-	stopCh chan struct{}
+	stopCh       chan struct{}
+	lastCommitAt time.Time
 	wg     sync.WaitGroup
 
 	// Callbacks
@@ -370,11 +376,43 @@ func (e *BFTEngine) loop() {
 			e.runPrecommit(h, r)
 		case StepCommit:
 			// commit already applied inside tryFinalizePrecommitsLocked
-			time.Sleep(100 * time.Millisecond)
+			e.waitBlockInterval()
 		}
 
 		// Small yield so we don't busy-spin
 		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+// waitBlockInterval sleeps until MinBlockInterval has elapsed since last commit.
+// Solo BFT reaches +2/3 instantly; without this, blocks seal every ~100ms.
+func (e *BFTEngine) waitBlockInterval() {
+	interval := e.cfg.MinBlockInterval
+	if interval <= 0 {
+		interval = 120 * time.Second
+	}
+	e.mu.Lock()
+	last := e.lastCommitAt
+	e.mu.Unlock()
+	if last.IsZero() {
+		return
+	}
+	elapsed := time.Since(last)
+	if elapsed >= interval {
+		return
+	}
+	wait := interval - elapsed
+	log.Debug().
+		Dur("wait", wait).
+		Dur("interval", interval).
+		Msg("BFT: pacing next height to MinBlockInterval")
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+	select {
+	case <-e.stopCh:
+		return
+	case <-timer.C:
+		return
 	}
 }
 
@@ -699,6 +737,7 @@ func (e *BFTEngine) commitLocked(blockHash string, votes []Vote) {
 		header.LastCommitVotes = len(votes)
 		// Re-save with commit certificate fields
 		_ = e.store.SaveBlock(header)
+		e.markCommitted()
 		applied = result.Txs
 	} else {
 		// Should not happen often — we committed a hash we never saw as proposal
@@ -738,6 +777,10 @@ func (e *BFTEngine) commitLocked(blockHash string, votes []Vote) {
 	e.advanceHeightLocked()
 }
 
+func (e *BFTEngine) markCommitted() {
+	e.lastCommitAt = time.Now()
+}
+
 func (e *BFTEngine) advanceHeightLocked() {
 	e.height++
 	e.round = 0
@@ -756,6 +799,7 @@ func (e *BFTEngine) advanceHeightLocked() {
 
 func (e *BFTEngine) soloSeal(height uint64) {
 	// Same path as old Producer.trySeal for n<=1
+	e.waitBlockInterval()
 	sealerKey := e.privKey
 	proposer := e.localAddr
 	if proposer == "" {
@@ -776,10 +820,14 @@ func (e *BFTEngine) soloSeal(height uint64) {
 		time.Sleep(time.Second)
 		return
 	}
+	e.mu.Lock()
+	e.markCommitted()
+	e.mu.Unlock()
 	log.Info().
 		Uint64("height", result.Header.Height).
 		Str("hash", shortHash(result.Header.Hash)).
 		Int("txs", result.Header.TxCount).
+		Dur("next_in", e.cfg.MinBlockInterval).
 		Msg("BFT solo: block sealed")
 
 	if e.p2p != nil {
