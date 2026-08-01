@@ -8,41 +8,97 @@ Lightweight validator for EASTCHAIN, designed for the **Railway free tier**.
 - **This service (Railway)** → verifies signatures, seals blocks, persists state
 - **Lightnode** → receives sealed block headers
 
-## Features (Phase 1.1)
+## Features (Phase 1.2)
 
+- **BFT consensus** (Tendermint-inspired, default on): Propose → Prevote → Precommit → Commit with **+2/3 quorum**
 - **Mempool** (CometBFT-style): CheckTx → queue → included on seal
 - **Leader election**: solo always produces; **2+ validators** rotate by `height % n`
-- **Auto block producer**: seals an empty block every `BLOCK_INTERVAL_SEC` (default **120s**) so the chain tip always advances
+- **Auto block producer**: legacy path when `BFT_ENABLED=false`; with BFT the engine drives sealing
 - Numeric EIP-155 chain ID **172026** + string id `eastchain-1`
-- **libp2p GossipSub** — block announces and heartbeat gossip between validators / fullnodes
+- **libp2p GossipSub** — blocks, heartbeats, **and consensus** (proposals/votes/commits)
 - Local state (BadgerDB): balances, stake, pending unstake, nonces, uptime scores
 - **Genesis** with hard cap **1,000,000,000 EAST** + supply buckets (aligned with existing tokenomics)
 - **EIP-191 / secp256k1** signatures (compatible with ethers `personal_sign`)
 - `POST /consensus/propose` for Fullnode Browser proposals
+- `GET /consensus/status` — live BFT height/round/step/quorum
 - Old-block pruning (default keep 3000)
 - Single binary, small Dockerfile
 
+### BFT consensus (Phase 1.2)
+
+Enabled by default (`BFT_ENABLED` unset or anything except `false`).
+
+| Validators | Behaviour |
+|------------|-----------|
+| 0–1 | Solo seal (no voting) — same as before |
+| 2+ | Full round: leader proposes → all prevote → +2/3 → precommit → +2/3 → **commit** |
+
+Vote / proposal messages are EIP-191 signed:
+
+```
+EASTCHAIN_VOTE|{prevote|precommit}|{height}|{round}|{blockHash|NIL}
+EASTCHAIN_BFT_PROPOSAL|{height}|{round}|{blockHash}|{prevHash}
+```
+
+P2P topic: `eastchain/consensus/1.0.0`
+
+Double-sign (equivocation) is detected and logged; jailing is a later phase.
+
+Set `BFT_ENABLED=false` to fall back to the legacy interval-based `Producer`.
+
 ## Environment variables (Railway)
+
+### Required (production)
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `API_SECRET` | yes | Protects write endpoints |
-| `MINING_ORACLE_ADDRESS` | yes (for claim_mining) | EVM address of mining oracle; signs `EASTCHAIN_MINT\|...` |
-| `CHAIN_SIGNING_PRIVATE_KEY` | yes (for sealing) | `0x` + 32-byte hex (secp256k1) |
-| `CHAIN_SIGNING_ADDRESS` | recommended | Public address for the key above |
-| `NODE_ID` | no | default `validator-1` |
-| `DATA_DIR` | no | default `/app/data` (**attach a Volume**) |
-| `GENESIS_PATH` | no | default `/app/genesis.json` |
-| `KEEP_RECENT_BLOCKS` | no | default `3000` |
-| `BLOCK_INTERVAL_SEC` | no | default `120` — auto-seal interval for empty blocks |
-| `AUTO_PRODUCE` | no | default `true` — set `false` to disable auto producer |
-| `EPOCH_SECONDS` | no | default `604800` (1 week) — uptime epoch length |
-| `P2P_ENABLED` | no | default `true` |
-| `P2P_PORT` | no | default `4001` (TCP libp2p) |
-| `P2P_BOOTSTRAP` | no | comma-separated multiaddrs, e.g. `/ip4/x.x.x.x/tcp/4001/p2p/12D3KooW...` |
-| `P2P_PRIVATE_KEY` | no | optional stable peer identity (protobuf hex) |
-| `VALIDATORS` | no | comma-separated EVM addresses; enables round-robin when 2+ |
-| `PORT` | auto | Injected by Railway |
+| `API_SECRET` | **yes** | Shared secret for write endpoints (`X-API-Secret`). Reject all writes if empty in production. |
+| `CHAIN_SIGNING_PRIVATE_KEY` | **yes** | `0x` + 32-byte hex secp256k1 key used to seal blocks and sign BFT votes/proposals. |
+| `CHAIN_SIGNING_ADDRESS` | **yes** | EVM address of `CHAIN_SIGNING_PRIVATE_KEY`. Used for leader election and proposal identity. |
+| `DATA_DIR` | **yes** | Persistent state path (BadgerDB). On Railway: mount a **Volume** at `/app/data`. Default `./data`. |
+| `P2P_PRIVATE_KEY` | **yes** (prod) | Stable libp2p identity (protobuf-encoded private key, hex). If unset, peer ID changes on every restart and breaks bootstrap lists. |
+
+### Required for specific features
+
+| Variable | Required when | Description |
+|----------|---------------|-------------|
+| `MINING_ORACLE_ADDRESS` | using `claim_mining` | EVM address allowed to sign `EASTCHAIN_MINT\|...` oracle messages. Claim mining is **disabled** if unset. |
+| `VALIDATORS` | multi-validator / BFT | Comma-separated EVM addresses of the active validator set. Enables round-robin leader election and BFT quorum when 2+. |
+| `P2P_BOOTSTRAP` | joining an existing network | Comma-separated multiaddrs of seed peers, e.g. `/ip4/x.x.x.x/tcp/4001/p2p/12D3KooW...`. First node may leave this empty. |
+
+### Optional
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `NODE_ID` | `validator-1` | Human-readable node label in logs/stats. |
+| `NODE_NAME` | `east-validator` | Display name in `/health`. |
+| `GENESIS_PATH` | `/app/genesis.json` | Path to genesis JSON (supply buckets, chain id). |
+| `KEEP_RECENT_BLOCKS` | `3000` | Local block history retention before prune. |
+| `BLOCK_INTERVAL_SEC` | `120` | Target block interval (solo/legacy producer; BFT uses round timeouts). |
+| `AUTO_PRODUCE` | `true` | Legacy interval producer when `BFT_ENABLED=false`. |
+| `BFT_ENABLED` | `true` | Tendermint-style BFT (Propose → Prevote → Precommit → Commit). Set `false` for legacy producer only. |
+| `EPOCH_SECONDS` | `604800` | Uptime epoch length (1 week). |
+| `P2P_ENABLED` | `true` | Enable libp2p (GossipSub, DHT, mDNS, block sync). |
+| `P2P_PORT` | `4001` | TCP listen port for libp2p. Must be reachable by peers (open firewall / Railway TCP). |
+| `P2P_CONN_LOW` | `50` | Connection-manager low water mark (do not prune below this). |
+| `P2P_CONN_HIGH` | `200` | Connection-manager high water mark (prune above this). |
+| `HTTP_ADDR` | `:$PORT` or `:8080` | HTTP API bind address. |
+| `PORT` | (Railway) | Injected by Railway; used when `HTTP_ADDR` is unset. |
+
+### Minimal production example
+
+```bash
+API_SECRET=<long-random-string>
+CHAIN_SIGNING_PRIVATE_KEY=0x...
+CHAIN_SIGNING_ADDRESS=0xYourValidatorAddress
+DATA_DIR=/app/data
+P2P_PRIVATE_KEY=<stable-libp2p-protobuf-hex>
+P2P_PORT=4001
+P2P_BOOTSTRAP=/ip4/<seed-ip>/tcp/4001/p2p/<seed-peer-id>
+VALIDATORS=0xValidatorA,0xValidatorB,0xValidatorC
+MINING_ORACLE_ADDRESS=0xOracleAddress   # if mining claims are enabled
+BFT_ENABLED=true
+```
 
 ## API
 
@@ -134,6 +190,22 @@ Min fullnode stake: **10 EAST**
 
 ## P2P (libp2p)
 
+### Peer discovery (public network)
+
+Nodes discover each other via:
+
+1. **Bootstrap seeds** — `P2P_BOOTSTRAP` multiaddrs (first contact)
+2. **Kademlia DHT** — every validator runs `ModeServer` and advertises under namespace `eastchain-validators-v1`
+3. **mDNS** — automatic on the same LAN / docker network (`eastchain._udp`)
+4. **Hole punching + AutoRelay + UPnP** — improves reachability behind NAT
+
+After the first few seeds are online, additional validators can join with an empty bootstrap list once they learn at least one peer (or share one seed).
+
+Connection manager defaults: keep ~50–200 peers (`P2P_CONN_LOW` / `P2P_CONN_HIGH`) to resist connection floods.
+
+Block catch-up: stream protocol `/eastchain/blocksync/1.0.0` (request up to 50 headers per call).
+
+Topics:
 Topics:
 - `eastchain/blocks/1.0.0` — block header announce after seal
 - `eastchain/heartbeats/1.0.0` — uptime gossip

@@ -24,12 +24,15 @@ func main() {
 	log.Logger = log.Output(zerolog.ConsoleWriter{Out: os.Stderr})
 
 	cfg := config.Load()
+	bftEnabled := os.Getenv("BFT_ENABLED") != "false"
+
 	log.Info().
 		Str("node_id", cfg.NodeID).
 		Str("data_dir", cfg.DataDir).
 		Str("http", cfg.HTTPAddr).
 		Dur("block_interval", cfg.BlockInterval).
 		Bool("auto_produce", cfg.AutoProduce).
+		Bool("bft_enabled", bftEnabled).
 		Msg("starting east-validator (sealer mode)")
 
 	store, err := state.Open(cfg.DataDir)
@@ -66,12 +69,13 @@ func main() {
 	// Local proposer identity
 	localAddr := os.Getenv("CHAIN_SIGNING_ADDRESS")
 	if localAddr == "" && os.Getenv("CHAIN_SIGNING_PRIVATE_KEY") != "" {
-		// derived later in producer if needed
+		// derived later in producer / BFT if needed
 	}
 
 	// Leader schedule (CometBFT-style round-robin when 2+ validators)
 	leader := consensus.NewLeaderSchedule(localAddr)
 	leader.SetStore(store)
+	// Prefer persisted set (survives restart); env overrides on first boot / ops change.
 	if raw := os.Getenv("VALIDATORS"); raw != "" {
 		parts := strings.Split(raw, ",")
 		var addrs []string
@@ -81,11 +85,14 @@ func main() {
 				addrs = append(addrs, p)
 			}
 		}
-		leader.SetValidators(addrs)
-		log.Info().Int("count", len(addrs)).Msg("validator set loaded from VALIDATORS env")
+		leader.SetValidators(addrs) // also persists
+		log.Info().Int("count", len(addrs)).Msg("validator set loaded from VALIDATORS env (persisted)")
+	} else if leader.LoadFromStore() {
+		log.Info().Int("count", leader.Count()).Msg("validator set loaded from local store")
 	} else if localAddr != "" {
 		// Solo: register self so stats are consistent
 		leader.SetValidators([]string{localAddr})
+		log.Info().Str("local", localAddr).Msg("validator set: solo self-registration")
 	}
 
 	// Mempool
@@ -112,8 +119,48 @@ func main() {
 		}
 	})
 
+	// Block-sync stream protocol so peers that fall behind can catch up
+	// without relying solely on gossip (which only covers the tip).
+	p2pNode.RegisterSyncHandler(p2p.StoreBlockProvider{Store: store})
+
+	// ── BFT engine (default on) ─────────────────────────────────────
+	var bft *consensus.BFTEngine
+	if bftEnabled {
+		bftCfg := consensus.DefaultBFTConfig()
+		bftCfg.Enabled = true
+		bft = consensus.NewBFTEngine(store, leader, bftCfg)
+		bft.SetMempool(pool)
+		bft.SetP2P(p2pNode)
+		bft.Start()
+		defer bft.Stop()
+
+		// Wire P2P consensus messages into the engine
+		p2pNode.OnConsensus(func(m p2p.ConsensusMsg) {
+			switch m.Kind {
+			case p2p.ConsensusKindProposal:
+				if m.Proposal != nil {
+					bft.HandleProposal(consensus.ProposalFromP2P(m.Proposal))
+				}
+			case p2p.ConsensusKindVote:
+				if m.Vote != nil {
+					bft.HandleVote(consensus.VoteFromP2P(m.Vote))
+				}
+			case p2p.ConsensusKindCommit:
+				// Informational — block body still arrives via TopicBlocks
+				if m.Commit != nil {
+					log.Debug().
+						Uint64("height", m.Commit.Height).
+						Str("hash", m.Commit.BlockHash).
+						Int("votes", m.Commit.VoteCount).
+						Msg("BFT commit cert received")
+				}
+			}
+		})
+	}
+
+	// Legacy auto-producer: only when BFT is disabled (backward compatible)
 	var producer *consensus.Producer
-	if cfg.AutoProduce {
+	if cfg.AutoProduce && !bftEnabled {
 		producer = consensus.NewProducer(store, cfg.BlockInterval)
 		producer.SetP2P(p2pNode)
 		producer.SetMempool(pool)
@@ -123,10 +170,23 @@ func main() {
 	}
 
 	p2pNode.OnBlock(func(a p2p.BlockAnnounce) {
-		if err := consensus.VerifyAndSaveGossipedBlock(store, a.Height, a.Hash, a.PrevHash, a.Timestamp, a.Proposer, a.Txs); err != nil {
+		// P0: verify sealer sig, proposer in set, full tx ValidateBasic, atomic apply
+		err := consensus.VerifyAndSaveGossipedBlockStrict(store, consensus.GossipBlockInput{
+			Height:           a.Height,
+			Hash:             a.Hash,
+			PrevHash:         a.PrevHash,
+			Timestamp:        a.Timestamp,
+			Proposer:         a.Proposer,
+			Signature:        a.Signature,
+			Txs:              a.Txs,
+			AllowedProposers: leader.Validators(),
+		})
+		if err != nil {
 			log.Debug().Err(err).Uint64("height", a.Height).Str("from", a.FromPeer).Msg("gossiped block rejected")
+			p2pNode.ReportPeer(a.FromPeer, -10, "invalid_block")
 			return
 		}
+		p2pNode.ReportPeer(a.FromPeer, +2, "valid_block")
 		if producer != nil {
 			producer.NotifyExternalProposal()
 		}
@@ -139,12 +199,16 @@ func main() {
 	})
 
 	srv := api.New(cfg, store, producer, p2pNode, pool, leader)
+	srv.SetBFT(bft)
 
 	go func() {
 		sig := make(chan os.Signal, 1)
 		signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 		<-sig
 		log.Info().Msg("shutting down...")
+		if bft != nil {
+			bft.Stop()
+		}
 		if producer != nil {
 			producer.Stop()
 		}

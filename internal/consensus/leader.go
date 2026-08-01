@@ -47,11 +47,9 @@ func (l *LeaderSchedule) SetStore(s *state.Store) {
 	l.store = s
 }
 
-// eligibleValidatorsLocked returns the registered validators whose current
-// staked balance still meets the genesis minimum. Caller must hold l.mu.
-// If store isn't wired yet, returns the full list unfiltered (fail-open on
-// missing wiring, not fail-closed — avoids bricking solo/dev setups that
-// never call SetStore).
+// eligibleValidatorsLocked returns registered validators that meet the
+// minimum stake and are not jailed. Caller must hold l.mu.
+// If store isn't wired yet, returns the full list unfiltered (fail-open).
 func (l *LeaderSchedule) eligibleValidatorsLocked() []string {
 	if l.store == nil {
 		return l.validators
@@ -59,13 +57,17 @@ func (l *LeaderSchedule) eligibleValidatorsLocked() []string {
 	minStake := l.store.MinValidatorStake()
 	out := make([]string, 0, len(l.validators))
 	for _, addr := range l.validators {
+		if jailed, _, err := l.store.IsJailed(addr); err == nil && jailed {
+			continue
+		}
 		acc, err := l.store.GetAccount(addr)
 		if err != nil {
-			continue // unreadable account — treat as ineligible rather than crash the schedule
+			continue
 		}
-		if acc.Staked >= minStake {
-			out = append(out, addr)
+		if minStake > 0 && acc.Staked < minStake {
+			continue
 		}
+		out = append(out, addr)
 	}
 	return out
 }
@@ -78,6 +80,8 @@ func (l *LeaderSchedule) SetLocalAddress(addr string) {
 }
 
 // SetValidators replaces the active validator set. Empty list = solo mode.
+// When a store is wired, the set is also persisted (and epoch bumped) so
+// restarts and gossip peers converge on the same roster.
 func (l *LeaderSchedule) SetValidators(addrs []string) {
 	uniq := make(map[string]struct{})
 	for _, a := range addrs {
@@ -94,7 +98,35 @@ func (l *LeaderSchedule) SetValidators(addrs []string) {
 
 	l.mu.Lock()
 	l.validators = list
+	store := l.store
 	l.mu.Unlock()
+
+	if store != nil && len(list) > 0 {
+		if _, err := store.SaveValidatorSet(list); err != nil {
+			// Non-fatal: in-memory set still applies this process lifetime.
+			_ = err
+		}
+	}
+}
+
+// LoadFromStore replaces the in-memory set with the persisted one (if any).
+// Returns true if a persisted set was loaded.
+func (l *LeaderSchedule) LoadFromStore() bool {
+	l.mu.RLock()
+	store := l.store
+	l.mu.RUnlock()
+	if store == nil {
+		return false
+	}
+	rec, err := store.GetValidatorSet()
+	if err != nil || rec == nil || len(rec.Addresses) == 0 {
+		return false
+	}
+	l.mu.Lock()
+	l.validators = append([]string(nil), rec.Addresses...)
+	sort.Strings(l.validators)
+	l.mu.Unlock()
+	return true
 }
 
 // IsEligible reports whether addr currently meets the minimum validator

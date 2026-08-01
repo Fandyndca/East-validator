@@ -215,11 +215,16 @@ func SealBlockWithTxs(store *state.Store, sealerPrivKey, proposer string, txs []
 		}
 	}
 
+	stateRoot, err := store.ComputeStateRoot()
+	if err != nil {
+		stateRoot = ""
+	}
+
 	header := state.BlockHeader{
 		Height:    height,
 		Hash:      blockHash,
 		PrevHash:  prevHash,
-		StateRoot: "",
+		StateRoot: stateRoot,
 		TxHashes:  txHashes,
 		Timestamp: ts,
 		Proposer:  proposer,

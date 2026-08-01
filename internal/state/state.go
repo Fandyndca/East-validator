@@ -32,6 +32,10 @@ type BlockHeader struct {
 	Proposer  string   `json:"proposer"`
 	TxCount   int      `json:"tx_count"`
 	Signature string   `json:"signature,omitempty"`
+	// LastCommitRound / LastCommitVotes: finality certificate (precommit count at commit).
+	LastCommitRound int32  `json:"last_commit_round,omitempty"`
+	LastCommitVotes int    `json:"last_commit_votes,omitempty"`
+	LastCommitHash  string `json:"last_commit_hash,omitempty"` // hash of concatenated vote sigs (optional)
 }
 
 type Store struct {

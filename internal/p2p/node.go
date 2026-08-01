@@ -17,6 +17,7 @@ import (
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
+	"github.com/libp2p/go-libp2p/p2p/net/connmgr"
 	"github.com/libp2p/go-libp2p/p2p/security/noise"
 	libp2ptls "github.com/libp2p/go-libp2p/p2p/security/tls"
 	"github.com/multiformats/go-multiaddr"
@@ -28,7 +29,69 @@ import (
 const (
 	TopicBlocks     = "eastchain/blocks/1.0.0"
 	TopicHeartbeats = "eastchain/heartbeats/1.0.0"
+	TopicConsensus  = "eastchain/consensus/1.0.0"
+	TopicValidatorSet = "eastchain/valset/1.0.0"
 )
+
+// Consensus message kinds on TopicConsensus.
+const (
+	ConsensusKindProposal = "proposal"
+	ConsensusKindVote     = "vote"
+	ConsensusKindCommit   = "commit"
+	ConsensusKindValSet  = "valset"
+)
+
+// BFTProposal is the wire form of a BFT proposal.
+// Txs carries full transaction bodies so non-leaders apply the same state.
+type BFTProposal struct {
+	Height     uint64            `json:"height"`
+	Round      int32             `json:"round"`
+	BlockHash  string            `json:"block_hash"`
+	PrevHash   string            `json:"prev_hash"`
+	MerkleRoot string            `json:"merkle_root"`
+	Timestamp  int64             `json:"timestamp"`
+	Proposer   string            `json:"proposer"`
+	TxHashes   []string          `json:"tx_hashes,omitempty"`
+	Txs        []*tx.Transaction `json:"txs,omitempty"`
+	POLRound   int32             `json:"pol_round"`
+	Signature  string            `json:"signature"`
+}
+
+// ValidatorSetMsg is gossiped when the active validator set changes.
+type ValidatorSetMsg struct {
+	Epoch     uint64   `json:"epoch"`
+	Addresses []string `json:"addresses"`
+	UpdatedAt int64    `json:"updated_at"`
+	FromPeer  string   `json:"from_peer,omitempty"`
+}
+
+// BFTVote is the wire form of a prevote/precommit.
+type BFTVote struct {
+	Type      string `json:"type"` // prevote | precommit
+	Height    uint64 `json:"height"`
+	Round     int32  `json:"round"`
+	BlockHash string `json:"block_hash"`
+	Voter     string `json:"voter"`
+	Timestamp int64  `json:"timestamp"`
+	Signature string `json:"signature"`
+}
+
+// CommitCert is a lightweight commit announcement (full votes optional later).
+type CommitCert struct {
+	Height    uint64 `json:"height"`
+	Round     int32  `json:"round"`
+	BlockHash string `json:"block_hash"`
+	VoteCount int    `json:"vote_count"`
+}
+
+// ConsensusMsg envelopes proposal / vote / commit on the consensus topic.
+type ConsensusMsg struct {
+	Kind     string       `json:"kind"`
+	Proposal *BFTProposal `json:"proposal,omitempty"`
+	Vote     *BFTVote     `json:"vote,omitempty"`
+	Commit   *CommitCert  `json:"commit,omitempty"`
+	FromPeer string       `json:"from_peer,omitempty"`
+}
 
 // BlockAnnounce is gossiped after a block is sealed.
 type BlockAnnounce struct {
@@ -59,6 +122,9 @@ type Config struct {
 	PrivateKeyHex string
 	Bootstrap     []string
 	NodeID        string
+	// ConnLow / ConnHigh bound the connection manager (public DoS protection).
+	ConnLow  int
+	ConnHigh int
 }
 
 type Node struct {
@@ -67,12 +133,16 @@ type Node struct {
 	ps     *pubsub.PubSub
 	blocks *pubsub.Topic
 	hb     *pubsub.Topic
+	cons   *pubsub.Topic
+	disc   *discoveryService
+	scorer *PeerScorer
 	ctx    context.Context
 	cancel context.CancelFunc
 
 	mu          sync.RWMutex
 	onBlock     func(BlockAnnounce)
 	onHeartbeat func(HeartbeatMsg)
+	onConsensus func(ConsensusMsg)
 	peerCount   int
 }
 
@@ -91,12 +161,27 @@ func LoadConfigFromEnv(nodeID string) Config {
 			}
 		}
 	}
+	low, high := 50, 200
+	if v := os.Getenv("P2P_CONN_LOW"); v != "" {
+		fmt.Sscanf(v, "%d", &low)
+	}
+	if v := os.Getenv("P2P_CONN_HIGH"); v != "" {
+		fmt.Sscanf(v, "%d", &high)
+	}
+	if low < 10 {
+		low = 10
+	}
+	if high <= low {
+		high = low + 50
+	}
 	return Config{
 		Enabled:       enabled,
 		ListenPort:    port,
 		PrivateKeyHex: os.Getenv("P2P_PRIVATE_KEY"),
 		Bootstrap:     bootstrap,
 		NodeID:        nodeID,
+		ConnLow:       low,
+		ConnHigh:      high,
 	}
 }
 
@@ -120,6 +205,20 @@ func New(cfg Config) (*Node, error) {
 		return nil, err
 	}
 
+	// Connection manager: prune excess peers so a public node cannot be
+	// connection-flooded into OOM / FD exhaustion.
+	if cfg.ConnLow <= 0 {
+		cfg.ConnLow = 50
+	}
+	if cfg.ConnHigh <= cfg.ConnLow {
+		cfg.ConnHigh = cfg.ConnLow + 50
+	}
+	cm, err := connmgr.NewConnManager(cfg.ConnLow, cfg.ConnHigh, connmgr.WithGracePeriod(time.Minute))
+	if err != nil {
+		cancel()
+		return nil, fmt.Errorf("connmgr: %w", err)
+	}
+
 	h, err := libp2p.New(
 		libp2p.Identity(priv),
 		libp2p.ListenAddrs(listen),
@@ -127,15 +226,21 @@ func New(cfg Config) (*Node, error) {
 		libp2p.Security(noise.ID, noise.New),
 		libp2p.DefaultTransports,
 		libp2p.DefaultMuxers,
+		libp2p.ConnectionManager(cm),
 		libp2p.EnableNATService(),
 		libp2p.EnableRelay(),
+		libp2p.EnableHolePunching(),
+		libp2p.NATPortMap(), // UPnP / NAT-PMP when available
 	)
 	if err != nil {
 		cancel()
 		return nil, fmt.Errorf("libp2p host: %w", err)
 	}
 
-	ps, err := pubsub.NewGossipSub(ctx, h)
+	// GossipSub with slightly stricter validation resource limits for public nets.
+	ps, err := pubsub.NewGossipSub(ctx, h,
+		pubsub.WithMaxMessageSize(1<<20), // 1 MiB max gossip message
+	)
 	if err != nil {
 		_ = h.Close()
 		cancel()
@@ -154,13 +259,43 @@ func New(cfg Config) (*Node, error) {
 		cancel()
 		return nil, err
 	}
+	consTopic, err := ps.Join(TopicConsensus)
+	if err != nil {
+		_ = h.Close()
+		cancel()
+		return nil, err
+	}
+
+	// Parse bootstrap multiaddrs → AddrInfo for DHT seeding.
+	var bootInfos []peer.AddrInfo
+	for _, raw := range cfg.Bootstrap {
+		maddr, err := multiaddr.NewMultiaddr(raw)
+		if err != nil {
+			log.Warn().Str("addr", raw).Err(err).Msg("invalid bootstrap multiaddr")
+			continue
+		}
+		info, err := peer.AddrInfoFromP2pAddr(maddr)
+		if err != nil {
+			log.Warn().Str("addr", raw).Err(err).Msg("bootstrap addr missing /p2p/PEERID")
+			continue
+		}
+		bootInfos = append(bootInfos, *info)
+	}
+
+	disc, err := startDiscovery(ctx, h, bootInfos)
+	if err != nil {
+		log.Warn().Err(err).Msg("discovery start failed — falling back to manual bootstrap only")
+	}
 
 	n := &Node{
 		cfg:    cfg,
 		host:   h,
 		ps:     ps,
+		disc:   disc,
+		scorer: NewPeerScorer(),
 		blocks: blocks,
 		hb:     hbTopic,
+		cons:   consTopic,
 		ctx:    ctx,
 		cancel: cancel,
 	}
@@ -170,6 +305,10 @@ func New(cfg Config) (*Node, error) {
 		return nil, err
 	}
 	if err := n.subscribeHeartbeats(); err != nil {
+		n.Close()
+		return nil, err
+	}
+	if err := n.subscribeConsensus(); err != nil {
 		n.Close()
 		return nil, err
 	}
@@ -195,9 +334,10 @@ func New(cfg Config) (*Node, error) {
 		Str("peer_id", h.ID().String()).
 		Strs("addrs", addrStrings(h)).
 		Int("port", cfg.ListenPort).
-		Msg("libp2p node started")
+		Int("conn_low", cfg.ConnLow).
+		Int("conn_high", cfg.ConnHigh).
+		Msg("libp2p node started (DHT + mDNS + hole-punching)")
 
-	go n.dialBootstrap()
 	return n, nil
 }
 
@@ -233,6 +373,24 @@ func (n *Node) OnHeartbeat(fn func(HeartbeatMsg)) {
 	n.mu.Lock()
 	n.onHeartbeat = fn
 	n.mu.Unlock()
+}
+
+func (n *Node) OnConsensus(fn func(ConsensusMsg)) {
+	n.mu.Lock()
+	n.onConsensus = fn
+	n.mu.Unlock()
+}
+
+func (n *Node) PublishConsensus(m ConsensusMsg) error {
+	if !n.Enabled() || n.cons == nil {
+		return nil
+	}
+	m.FromPeer = n.PeerID()
+	b, err := json.Marshal(m)
+	if err != nil {
+		return err
+	}
+	return n.cons.Publish(n.ctx, b)
 }
 
 func (n *Node) PublishBlock(a BlockAnnounce) error {
@@ -324,6 +482,41 @@ func (n *Node) subscribeHeartbeats() error {
 	return nil
 }
 
+func (n *Node) subscribeConsensus() error {
+	if n.cons == nil {
+		return nil
+	}
+	sub, err := n.cons.Subscribe()
+	if err != nil {
+		return err
+	}
+	go func() {
+		for {
+			msg, err := sub.Next(n.ctx)
+			if err != nil {
+				return
+			}
+			if msg.ReceivedFrom == n.host.ID() {
+				continue
+			}
+			var m ConsensusMsg
+			if err := json.Unmarshal(msg.Data, &m); err != nil {
+				continue
+			}
+			m.FromPeer = msg.ReceivedFrom.String()
+			n.mu.RLock()
+			fn := n.onConsensus
+			n.mu.RUnlock()
+			if fn != nil {
+				fn(m)
+			} else {
+				log.Debug().Str("kind", m.Kind).Msg("p2p consensus msg")
+			}
+		}
+	}()
+	return nil
+}
+
 func (n *Node) dialBootstrap() {
 	if n.host == nil {
 		return
@@ -351,6 +544,9 @@ func (n *Node) dialBootstrap() {
 }
 
 func (n *Node) Close() error {
+	if n.disc != nil {
+		n.disc.Close()
+	}
 	if n.cancel != nil {
 		n.cancel()
 	}
@@ -364,14 +560,50 @@ func (n *Node) Stats() map[string]any {
 	if !n.Enabled() {
 		return map[string]any{"enabled": false}
 	}
-	return map[string]any{
-		"enabled":     true,
-		"peer_id":     n.PeerID(),
-		"peers":       n.PeerCount(),
-		"listen":      n.ListenAddrs(),
-		"topics":      []string{TopicBlocks, TopicHeartbeats},
-		"bootstrap_n": len(n.cfg.Bootstrap),
+	known := 0
+	if n.disc != nil {
+		known = n.disc.KnownPeerCount()
 	}
+	return map[string]any{
+		"enabled":       true,
+		"peer_id":       n.PeerID(),
+		"peers":         n.PeerCount(),
+		"known_peers":   known,
+		"listen":        n.ListenAddrs(),
+		"topics":        []string{TopicBlocks, TopicHeartbeats, TopicConsensus},
+		"bootstrap_n":   len(n.cfg.Bootstrap),
+		"discovery":     DiscoveryNamespace,
+		"mdns_tag":      mdnsServiceTag,
+		"sync_protocol": string(SyncProtocolID),
+		"conn_low":      n.cfg.ConnLow,
+		"conn_high":     n.cfg.ConnHigh,
+		"scoring":      n.Scorer().Snapshot(),
+	}
+}
+
+// Host exposes the libp2p host for stream protocols (block sync).
+func (n *Node) Host() host.Host { return n.host }
+
+
+func (n *Node) Scorer() *PeerScorer {
+	if n.scorer == nil {
+		n.scorer = NewPeerScorer()
+	}
+	return n.scorer
+}
+
+func (n *Node) ReportPeer(idStr string, delta int, reason string) {
+	if n.scorer == nil || idStr == "" {
+		return
+	}
+	pid, err := peer.Decode(idStr)
+	if err != nil {
+		return
+	}
+	if delta < 0 && n.scorer.IsBanned(pid) {
+		return
+	}
+	n.scorer.Add(pid, delta, reason)
 }
 
 func loadOrGenerateKey(hexKey string) (crypto.PrivKey, error) {

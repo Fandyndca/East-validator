@@ -23,6 +23,7 @@ type Server struct {
 	store    *state.Store
 	http     *http.Server
 	producer *consensus.Producer
+	bft      *consensus.BFTEngine
 	p2p      *p2p.Node
 	pool     *mempool.Mempool
 	leader   *consensus.LeaderSchedule
@@ -33,8 +34,12 @@ func New(cfg config.Config, store *state.Store, producer *consensus.Producer, p2
 	r := mux.NewRouter()
 
 	r.HandleFunc("/health", s.handleHealth).Methods("GET")
+	r.HandleFunc("/metrics", s.handleMetrics).Methods("GET")
+	r.HandleFunc("/rpc", s.handleJSONRPC).Methods("POST")
+	r.HandleFunc("/", s.handleJSONRPC).Methods("POST") // eth-style root RPC
 	r.HandleFunc("/stats", s.handleStats).Methods("GET")
 	r.HandleFunc("/account/{address}", s.handleGetAccount).Methods("GET")
+	r.HandleFunc("/account/{address}/proof", s.handleAccountProof).Methods("GET")
 	r.HandleFunc("/block/latest", s.handleLatestBlock).Methods("GET")
 	r.HandleFunc("/block/{height}", s.handleGetBlock).Methods("GET")
 	r.HandleFunc("/supply", s.handleSupply).Methods("GET")
@@ -51,20 +56,30 @@ func New(cfg config.Config, store *state.Store, producer *consensus.Producer, p2
 	r.HandleFunc("/mempool/txs", s.handleMempoolTxs).Methods("GET")
 	r.HandleFunc("/consensus/propose", s.auth(s.handlePropose)).Methods("POST")
 	r.HandleFunc("/consensus/leader", s.handleLeader).Methods("GET")
+	r.HandleFunc("/consensus/status", s.handleBFTStatus).Methods("GET")
 	r.HandleFunc("/validator/register", s.handleRegisterValidator).Methods("POST")
 	r.HandleFunc("/admin/validators", s.auth(s.handleSetValidators)).Methods("POST")
 	r.HandleFunc("/admin/validators", s.handleGetValidators).Methods("GET")
 	r.HandleFunc("/admin/seed", s.auth(s.handleSeed)).Methods("POST")
 	r.HandleFunc("/admin/prune", s.auth(s.handlePrune)).Methods("POST")
+	r.HandleFunc("/admin/backup", s.auth(s.handleBackup)).Methods("POST")
+	r.HandleFunc("/admin/restore-accounts", s.auth(s.handleRestoreAccounts)).Methods("POST")
+	r.HandleFunc("/admin/jail", s.handleListJailed).Methods("GET")
+	r.HandleFunc("/admin/unjail", s.auth(s.handleUnjail)).Methods("POST")
 
 	s.http = &http.Server{
 		Addr:         cfg.HTTPAddr,
-		Handler:      r,
+		Handler:      withPublicGuards(r),
 		ReadTimeout:  10 * time.Second,
 		WriteTimeout: 15 * time.Second,
 		IdleTimeout:  60 * time.Second,
 	}
 	return s
+}
+
+// SetBFT wires the BFT engine after construction (optional).
+func (s *Server) SetBFT(e *consensus.BFTEngine) {
+	s.bft = e
 }
 
 func (s *Server) Start() error {
@@ -89,7 +104,7 @@ func (s *Server) auth(next http.HandlerFunc) http.HandlerFunc {
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]any{
+	out := map[string]any{
 		"status":           "ok",
 		"node_id":          s.cfg.NodeID,
 		"name":             s.cfg.NodeName,
@@ -103,11 +118,35 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		"p2p":              s.p2pStats(),
 		"mempool":          s.mempoolStats(),
 		"leader":           s.leaderStats(),
-	})
+	}
+	if s.bft != nil {
+		out["bft"] = s.bft.Stats()
+	} else {
+		out["bft"] = map[string]any{"enabled": false}
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+func (s *Server) handleBFTStatus(w http.ResponseWriter, r *http.Request) {
+	if s.bft == nil {
+		writeJSON(w, http.StatusOK, map[string]any{"enabled": false, "mode": "legacy_producer"})
+		return
+	}
+	writeJSON(w, http.StatusOK, s.bft.Stats())
 }
 
 func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, s.store.Stats())
+}
+
+func (s *Server) handleAccountProof(w http.ResponseWriter, r *http.Request) {
+	addr := mux.Vars(r)["address"]
+	proof, err := s.store.ProveAccount(addr)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, http.StatusOK, proof)
 }
 
 func (s *Server) handleGetAccount(w http.ResponseWriter, r *http.Request) {
@@ -489,6 +528,57 @@ func (s *Server) handleSetValidators(w http.ResponseWriter, r *http.Request) {
 		"ok":     true,
 		"leader": s.leader.Stats(h + 1),
 	})
+}
+
+
+func (s *Server) handleBackup(w http.ResponseWriter, r *http.Request) {
+	path, err := s.store.ExportBackup(500)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "path": path})
+}
+
+func (s *Server) handleRestoreAccounts(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Path  string `json:"path"`
+		Force bool   `json:"force"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Path == "" {
+		http.Error(w, "path required", http.StatusBadRequest)
+		return
+	}
+	n, err := s.store.RestoreAccountsFromSnapshot(req.Path, req.Force)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "accounts_applied": n})
+}
+
+func (s *Server) handleListJailed(w http.ResponseWriter, r *http.Request) {
+	list, err := s.store.ListJailed(200)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"jailed": list})
+}
+
+func (s *Server) handleUnjail(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Address string `json:"address"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Address == "" {
+		http.Error(w, "address required", http.StatusBadRequest)
+		return
+	}
+	if err := s.store.UnjailValidator(req.Address); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "address": req.Address})
 }
 
 func writeJSON(w http.ResponseWriter, code int, v any) {
