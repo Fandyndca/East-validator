@@ -42,6 +42,7 @@ type Store struct {
 	totalMaxSupply    int64
 	minValidatorStake int64
 	chainSigningAddr  string
+	numericChainID    int64
 }
 
 func Open(dataDir string) (*Store, error) {
@@ -71,6 +72,7 @@ func (s *Store) InitGenesis(g *genesis.Genesis) error {
 			s.totalMaxSupply = g.TotalMaxSupply
 			s.minValidatorStake = g.MinValidatorStake
 			s.chainSigningAddr = g.ChainSigningAddress
+			s.numericChainID = g.NumericChainID
 			return nil
 		}
 
@@ -90,6 +92,7 @@ func (s *Store) InitGenesis(g *genesis.Genesis) error {
 
 		meta, _ := json.Marshal(map[string]any{
 			"chain_id":              g.ChainID,
+			"numeric_chain_id":      g.NumericChainID,
 			"genesis_time":          g.GenesisTime,
 			"total_max_supply":      g.TotalMaxSupply,
 			"min_validator_stake":   g.MinValidatorStake,
@@ -108,6 +111,7 @@ func (s *Store) InitGenesis(g *genesis.Genesis) error {
 		s.totalMaxSupply = g.TotalMaxSupply
 		s.minValidatorStake = g.MinValidatorStake
 		s.chainSigningAddr = g.ChainSigningAddress
+		s.numericChainID = g.NumericChainID
 		log.Info().
 			Int64("max_supply", g.TotalMaxSupply).
 			Int("buckets", len(g.Buckets)).
@@ -120,6 +124,7 @@ func (s *Store) InitGenesis(g *genesis.Genesis) error {
 func (s *Store) TotalMaxSupply() int64       { return s.totalMaxSupply }
 func (s *Store) MinValidatorStake() int64    { return s.minValidatorStake }
 func (s *Store) ChainSigningAddress() string { return s.chainSigningAddr }
+func (s *Store) NumericChainID() int64       { return s.numericChainID }
 
 func accountKey(addr string) []byte { return []byte("acc:" + addr) }
 func bucketKey(name string) []byte  { return []byte("bucket:" + name) }
@@ -369,6 +374,8 @@ func (s *Store) Stats() map[string]any {
 	lsm, vlog := s.db.Size()
 	return map[string]any{
 		"latest_height":         latest,
+		"chain_id":              "eastchain-1",
+		"numeric_chain_id":      s.numericChainID,
 		"total_max_supply":      s.totalMaxSupply,
 		"min_validator_stake":   s.minValidatorStake,
 		"chain_signing_address": s.chainSigningAddr,

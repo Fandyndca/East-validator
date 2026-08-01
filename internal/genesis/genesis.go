@@ -10,7 +10,18 @@ import (
 // TOTAL_MAX_SUPPLY mirrors east-wallet src/lib/db/ledger.ts
 const TotalMaxSupply int64 = 1_000_000_000
 
+// EASTChainID is the EIP-155 numeric chain ID (reserved on ChainList).
+const EASTChainID int64 = 172026
+
 // Default supply buckets — must sum exactly to TotalMaxSupply.
+//
+// These 10 buckets are a more granular breakdown of the official EASTCHAIN
+// tokenomics doc's 7 categories: mining + staking + validator + campaign
+// here sum to exactly 500,000,000 — the doc's single "Ecosystem Rewards"
+// category, which it describes as funding PoC mining, validator rewards,
+// staking rewards, and the referral program (i.e. exactly these four).
+// The doc's other 6 categories map 1:1 to liquidity/treasury/emergency/
+// marketing/team/founder below.
 var DefaultBuckets = []Bucket{
 	{Name: "mining", Cap: 300_000_000},
 	{Name: "staking", Cap: 80_000_000},
@@ -37,19 +48,21 @@ type AccountSeed struct {
 }
 
 type Genesis struct {
-	ChainID             string        `json:"chain_id"`
+	ChainID             string        `json:"chain_id"`              // human-readable, e.g. "eastchain-1"
+	NumericChainID      int64         `json:"numeric_chain_id"`      // EIP-155: 172026
 	GenesisTime         int64         `json:"genesis_time"`
 	TotalMaxSupply      int64         `json:"total_max_supply"`
 	Buckets             []Bucket      `json:"buckets"`
 	Accounts            []AccountSeed `json:"accounts,omitempty"`
-	MinValidatorStake   int64         `json:"min_validator_stake"`  // default 100
-	MinFullnodeStake    int64         `json:"min_fullnode_stake"`   // default 10
+	MinValidatorStake   int64         `json:"min_validator_stake"`
+	MinFullnodeStake    int64         `json:"min_fullnode_stake"`
 	ChainSigningAddress string        `json:"chain_signing_address,omitempty"`
 }
 
 func Default() Genesis {
 	return Genesis{
 		ChainID:           "eastchain-1",
+		NumericChainID:    EASTChainID,
 		GenesisTime:       time.Now().UnixMilli(),
 		TotalMaxSupply:    TotalMaxSupply,
 		Buckets:           append([]Bucket(nil), DefaultBuckets...),
@@ -59,6 +72,12 @@ func Default() Genesis {
 }
 
 func (g *Genesis) Validate() error {
+	if g.NumericChainID == 0 {
+		g.NumericChainID = EASTChainID
+	}
+	if g.NumericChainID != EASTChainID {
+		return fmt.Errorf("numeric_chain_id must be %d (got %d)", EASTChainID, g.NumericChainID)
+	}
 	var sum int64
 	for _, b := range g.Buckets {
 		if b.Cap < 0 || b.Minted < 0 {

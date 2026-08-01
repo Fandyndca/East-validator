@@ -1,8 +1,10 @@
 {
   "chain_id": "eastchain-1",
+  "numeric_chain_id": 172026,
   "genesis_time": 0,
   "total_max_supply": 1000000000,
   "min_validator_stake": 100,
+  "min_fullnode_stake": 10,
   "chain_signing_address": "",
   "buckets": [
     {
@@ -56,6 +58,5 @@
       "minted": 0
     }
   ],
-  "accounts": [],
-  "min_fullnode_stake": 10
+  "accounts": []
 }

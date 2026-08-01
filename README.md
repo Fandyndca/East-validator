@@ -1,34 +1,47 @@
 # east-validator (Go) — Sealer + Local State
 
-Lightweight validator for EASTCHAIN, designed for **Railway free tier**.
+Lightweight validator for EASTCHAIN, designed for the **Railway free tier**.
 
 ## Role
 
-- **Fullnode Browser** (online, stake ≥ 1000 EAST) → propose blocks bergantian
-- **This service (Railway)** → verify signature + seal + simpan state
-- **Lightnode** → terima header yang sudah di-seal
+- **Fullnode Browser** (online, stake ≥ threshold) → proposes blocks in turn
+- **This service (Railway)** → verifies signatures, seals blocks, persists state
+- **Lightnode** → receives sealed block headers
 
 ## Features (Phase 1.1)
 
-- Local state (BadgerDB): balances, stake, pending unstake, nonces
-- **Genesis** dengan hard cap **1,000,000,000 EAST** + supply buckets (sama tokenomics existing)
-- **EIP-191 / secp256k1** signature (compatible ethers `personal_sign`)
-- Endpoint `POST /consensus/propose` untuk Fullnode Browser
-- Pruning block lama (default keep 3000)
-- Single binary, Dockerfile kecil
+- **Mempool** (CometBFT-style): CheckTx → queue → included on seal
+- **Leader election**: solo always produces; **2+ validators** rotate by `height % n`
+- **Auto block producer**: seals an empty block every `BLOCK_INTERVAL_SEC` (default **120s**) so the chain tip always advances
+- Numeric EIP-155 chain ID **172026** + string id `eastchain-1`
+- **libp2p GossipSub** — block announces and heartbeat gossip between validators / fullnodes
+- Local state (BadgerDB): balances, stake, pending unstake, nonces, uptime scores
+- **Genesis** with hard cap **1,000,000,000 EAST** + supply buckets (aligned with existing tokenomics)
+- **EIP-191 / secp256k1** signatures (compatible with ethers `personal_sign`)
+- `POST /consensus/propose` for Fullnode Browser proposals
+- Old-block pruning (default keep 3000)
+- Single binary, small Dockerfile
 
-## Env vars (Railway)
+## Environment variables (Railway)
 
-| Variable | Wajib | Keterangan |
-|----------|-------|------------|
-| `API_SECRET` | ya | Proteksi endpoint write |
-| `CHAIN_SIGNING_PRIVATE_KEY` | ya (untuk seal) | 0x + 32-byte hex (secp256k1) |
-| `CHAIN_SIGNING_ADDRESS` | disarankan | Alamat publik pasangan key di atas |
-| `NODE_ID` | - | default `validator-1` |
-| `DATA_DIR` | - | default `/app/data` (pasang Volume!) |
-| `GENESIS_PATH` | - | default `/app/genesis.json` |
-| `KEEP_RECENT_BLOCKS` | - | default `3000` |
-| `PORT` | auto | Railway inject otomatis |
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `API_SECRET` | yes | Protects write endpoints |
+| `CHAIN_SIGNING_PRIVATE_KEY` | yes (for sealing) | `0x` + 32-byte hex (secp256k1) |
+| `CHAIN_SIGNING_ADDRESS` | recommended | Public address for the key above |
+| `NODE_ID` | no | default `validator-1` |
+| `DATA_DIR` | no | default `/app/data` (**attach a Volume**) |
+| `GENESIS_PATH` | no | default `/app/genesis.json` |
+| `KEEP_RECENT_BLOCKS` | no | default `3000` |
+| `BLOCK_INTERVAL_SEC` | no | default `120` — auto-seal interval for empty blocks |
+| `AUTO_PRODUCE` | no | default `true` — set `false` to disable auto producer |
+| `EPOCH_SECONDS` | no | default `604800` (1 week) — uptime epoch length |
+| `P2P_ENABLED` | no | default `true` |
+| `P2P_PORT` | no | default `4001` (TCP libp2p) |
+| `P2P_BOOTSTRAP` | no | comma-separated multiaddrs, e.g. `/ip4/x.x.x.x/tcp/4001/p2p/12D3KooW...` |
+| `P2P_PRIVATE_KEY` | no | optional stable peer identity (protobuf hex) |
+| `VALIDATORS` | no | comma-separated EVM addresses; enables round-robin when 2+ |
+| `PORT` | auto | Injected by Railway |
 
 ## API
 
@@ -41,7 +54,16 @@ GET /block/latest
 GET /block/{height}
 GET /supply
 GET /supply/{bucket}
+GET /p2p
 ```
+
+### Uptime / node integrity
+```
+POST /heartbeat          { "address", "node_id", "tier": "light"|"full" }
+GET  /uptime/{address}
+GET  /uptime/epoch/{epoch}?limit=100
+```
+Default epoch = 7 days (`EPOCH_SECONDS=604800`). Heartbeat count per epoch is the Phase-1 uptime score.
 
 ### Protected (`X-API-Secret`)
 ```
@@ -49,9 +71,10 @@ POST /tx
 POST /consensus/propose
 POST /admin/seed
 POST /admin/prune
+POST /admin/validators   { "validators": ["0x...", "0x..."] }
 ```
 
-### Contoh propose (Fullnode Browser)
+### Example propose (Fullnode Browser)
 
 ```json
 POST /consensus/propose
@@ -68,19 +91,19 @@ POST /consensus/propose
 }
 ```
 
-Signature message format:
+Proposal signature message format:
 ```
 EASTCHAIN_PROPOSAL|{proposal_id}|{height}|{block_hash}
 ```
 
-Sealer menandatangani header dengan:
+Sealer signs the header with:
 ```
 EASTCHAIN_BLOCK|{height}|{block_hash}
 ```
 
 ## Genesis / Max Supply
 
-Hard-coded & di-validate di boot:
+Hard-coded and validated at boot:
 
 | Bucket | Cap |
 |--------|-----|
@@ -96,21 +119,56 @@ Hard-coded & di-validate di boot:
 | founder | 50,000,000 |
 | **TOTAL** | **1,000,000,000** |
 
-Min stake validator: **100 EAST**
+Min validator stake: **100 EAST**  
+Min fullnode stake: **10 EAST**
 
-Min stake fullnode: **10 EAST** (sama `VALIDATOR_MINIMUM_STAKE`).
+## Deploy on Railway
 
-## Deploy Railway
-
-1. Push repo ke GitHub
+1. Push the repo to GitHub
 2. New Project → Deploy from GitHub
 3. **Volume** → mount `/app/data`
-4. Set env di atas
+4. Set the environment variables above
 5. Healthcheck path: `/health`
+6. Open TCP **4001** for libp2p (private networking between services is preferred)
 
-## Masih TODO (jangan pakai dana real dulu)
+## P2P (libp2p)
 
-- Tx signature verification (saat ini `/tx` masih open setelah API secret)
-- Leader schedule on-sealer (masih percaya proposal yang masuk)
-- State root Merkle sungguhan
-- Hubungkan broadcast ke Railway hub / lightnode yang sudah ada
+Topics:
+- `eastchain/blocks/1.0.0` — block header announce after seal
+- `eastchain/heartbeats/1.0.0` — uptime gossip
+
+After deploy, call `GET /p2p` and copy a value from `listen`, then set that multiaddr as `P2P_BOOTSTRAP` on other peers.
+
+## Still TODO (do not use real funds yet)
+
+- Transaction signature verification (`/tx` only checks API secret today)
+- Leader schedule on the sealer (currently trusts incoming proposals)
+- Real Merkle state root
+- Full block sync for peers that fall behind
+- DHT / mDNS discovery beyond manual bootstrap
+
+
+## Mempool & leader election
+
+### Mempool
+`POST /tx` runs **CheckTx** (nonce, balance, basic rules) and queues the transaction.
+On each auto-seal (when this node is leader), up to 100 txs are taken from the pool, applied, and committed in the block.
+
+### Leader election (CometBFT-inspired)
+| Validator count | Behavior |
+|-----------------|----------|
+| 0–1 | Local node always produces (solo / single) |
+| 2+ | Round-robin: leader for height `h` is `validators[h % n]` |
+
+Set the set via env:
+```
+VALIDATORS=0xaaa...,0xbbb...,0xccc...
+```
+Or at runtime (protected):
+```
+POST /admin/validators
+{ "validators": ["0xaaa...", "0xbbb..."] }
+```
+
+Each node must set `CHAIN_SIGNING_ADDRESS` to its own address so `IsLocalLeader` works.
+Inspect schedule: `GET /consensus/leader`.

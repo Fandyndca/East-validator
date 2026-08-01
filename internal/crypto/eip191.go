@@ -21,6 +21,22 @@ func BuildProposalMessage(proposalID string, height uint64, blockHash string) st
 	return fmt.Sprintf("EASTCHAIN_PROPOSAL|%s|%d|%s", proposalID, height, blockHash)
 }
 
+// BuildTxMessage — what a wallet/client signs to prove ownership of the
+// `from` address for a submitted transaction. The tx hash already commits
+// to type/from/to/amount/nonce/timestamp (see tx.Transaction.Hash), so
+// signing the hash is sufficient — no need to repeat every field here.
+// Keep stable; any change breaks every existing wallet integration.
+func BuildTxMessage(txHash string) string {
+	return fmt.Sprintf("EASTCHAIN_TX|%s", txHash)
+}
+
+// BuildHeartbeatMessage — what a node signs to prove it owns the address
+// claiming uptime credit. Without this, anyone could POST /heartbeat on
+// behalf of any address and inflate its uptime score.
+func BuildHeartbeatMessage(address, nodeID string, unixMs int64) string {
+	return fmt.Sprintf("EASTCHAIN_HEARTBEAT|%s|%s|%d", address, nodeID, unixMs)
+}
+
 // VerifyEIP191 recovers the signer address from an EIP-191 personal_sign signature
 // and checks it equals expectedAddress (case-insensitive).
 func VerifyEIP191(message, signatureHex, expectedAddress string) (bool, error) {

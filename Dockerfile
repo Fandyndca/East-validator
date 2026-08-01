@@ -2,7 +2,7 @@
 FROM golang:1.22-alpine AS builder
 
 WORKDIR /src
-RUN apk add --no-cache git ca-certificates gcc musl-dev
+RUN apk add --no-cache git ca-certificates
 
 COPY go.mod go.sum* ./
 RUN go mod download
@@ -28,8 +28,11 @@ ENV DATA_DIR=/app/data
 ENV GENESIS_PATH=/app/genesis.json
 ENV HTTP_ADDR=:8080
 ENV KEEP_RECENT_BLOCKS=3000
+ENV P2P_ENABLED=true
+ENV P2P_PORT=4001
+ENV BLOCK_INTERVAL_SEC=120
 
-EXPOSE 8080
+EXPOSE 8080 4001
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
   CMD wget -qO- http://127.0.0.1:8080/health || exit 1

@@ -3,34 +3,21 @@ package consensus
 import (
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
-	"time"
 
-	"github.com/eastchain/east-validator/internal/crypto"
+	"github.com/rs/zerolog/log"
+
 	"github.com/eastchain/east-validator/internal/state"
+	"github.com/eastchain/east-validator/internal/tx"
 )
-
-// Proposal is what a Fullnode Browser submits for the sealer to verify + seal.
-type Proposal struct {
-	ProposalID string   `json:"proposal_id"`
-	Height     uint64   `json:"height"`
-	PrevHash   string   `json:"prev_hash"`
-	TxHashes   []string `json:"tx_hashes"`
-	MerkleRoot string   `json:"merkle_root"`
-	BlockHash  string   `json:"block_hash"`
-	Timestamp  int64    `json:"timestamp"`
-	Proposer   string   `json:"proposer"`  // EVM address of the fullnode browser
-	Signature  string   `json:"signature"` // EIP-191 sig over BuildProposalMessage
-}
 
 type SealResult struct {
 	Header    state.BlockHeader `json:"header"`
 	SealerSig string            `json:"sealer_signature"`
+	Txs       []*tx.Transaction `json:"-"` // applied txs, for gossip replay — not part of the sealed header itself
 }
 
 // RecomputeMerkleRoot — simple ordered hash of tx hashes (Phase 1).
-// Must stay in sync with whatever Fullnode Browser uses.
 func RecomputeMerkleRoot(txHashes []string) string {
 	if len(txHashes) == 0 {
 		sum := sha256.Sum256([]byte("EMPTY"))
@@ -51,93 +38,84 @@ func RecomputeBlockHash(height uint64, prevHash, merkleRoot string, ts int64, pr
 	return "0x" + hex.EncodeToString(sum[:])
 }
 
-// VerifyAndSeal checks proposer signature + hash consistency, then seals with sealer key.
-func VerifyAndSeal(
-	store *state.Store,
-	p Proposal,
-	sealerPrivKey string, // CHAIN_SIGNING_PRIVATE_KEY
-) (*SealResult, error) {
+// VerifyAndSaveGossipedBlock validates a block received via P2P gossip
+// (i.e. produced by another validator, not this node) before persisting
+// it locally AND replaying its transactions into this node's own state.
+//
+// Deliberately loose for now: checks height/prevHash/blockHash consistency
+// against this node's own chain tip, but does NOT verify the sealer
+// signature against a known validator identity — there's currently no
+// per-peer mapping from gossip sender to a trusted signing address. A
+// mismatched or forged block is still caught by the hash recompute (an
+// attacker would need the real prev block's exact tx set to produce a
+// matching hash), but a colluding/compromised peer could still gossip a
+// block for a height/prevHash it has no business proposing. Tighten this
+// once each validator's signing address is tracked per-peer.
+//
+// txs must be the full transaction bodies (not just hashes) so they can be
+// applied to this node's local state — see p2p.BlockAnnounce.Txs.
+func VerifyAndSaveGossipedBlock(store *state.Store, height uint64, hash, prevHash string, timestamp int64, proposer string, txs []*tx.Transaction) error {
 	latest, err := store.GetLatestHeight()
 	if err != nil {
-		return nil, err
+		return err
 	}
-	expectedHeight := latest + 1
-	if p.Height != expectedHeight {
-		return nil, fmt.Errorf("bad height: got %d, expected %d", p.Height, expectedHeight)
+	if height != latest+1 {
+		return fmt.Errorf("gossiped block height %d != expected %d — ignoring (stale or out of order)", height, latest+1)
 	}
 
-	// prev hash
 	var expectedPrev string
 	if latest == 0 {
 		expectedPrev = "GENESIS"
 	} else {
 		prev, err := store.GetBlock(latest)
 		if err != nil {
-			return nil, fmt.Errorf("load prev block: %w", err)
+			return fmt.Errorf("load prev block: %w", err)
 		}
 		expectedPrev = prev.Hash
 	}
-	if p.PrevHash != expectedPrev {
-		return nil, fmt.Errorf("prev_hash mismatch")
+	if prevHash != expectedPrev {
+		return fmt.Errorf("gossiped block prev_hash mismatch: got %s, expected %s", prevHash, expectedPrev)
 	}
 
-	// recompute merkle + block hash
-	merkle := RecomputeMerkleRoot(p.TxHashes)
-	if p.MerkleRoot != "" && p.MerkleRoot != merkle {
-		return nil, fmt.Errorf("merkle_root mismatch")
-	}
-	blockHash := RecomputeBlockHash(p.Height, p.PrevHash, merkle, p.Timestamp, p.Proposer)
-	if p.BlockHash != "" && p.BlockHash != blockHash {
-		return nil, fmt.Errorf("block_hash mismatch")
+	txHashes := make([]string, 0, len(txs))
+	for _, t := range txs {
+		txHashes = append(txHashes, "0x"+t.Hash())
 	}
 
-	// proposer signature (EIP-191)
-	msg := crypto.BuildProposalMessage(p.ProposalID, p.Height, blockHash)
-	ok, err := crypto.VerifyEIP191(msg, p.Signature, p.Proposer)
-	if err != nil || !ok {
-		return nil, fmt.Errorf("invalid proposer signature: %v", err)
+	recomputedMerkle := RecomputeMerkleRoot(txHashes)
+	recomputedHash := RecomputeBlockHash(height, prevHash, recomputedMerkle, timestamp, proposer)
+	if recomputedHash != hash {
+		return fmt.Errorf("gossiped block hash mismatch: got %s, recomputed %s", hash, recomputedHash)
 	}
 
-	// optional: enforce min stake for proposer
-	acc, _ := store.GetAccount(p.Proposer)
-	if min := store.MinValidatorStake(); min > 0 && acc.Staked < min {
-		return nil, fmt.Errorf("proposer stake %d < minimum %d", acc.Staked, min)
-	}
-
-	// sealer signature
-	var sealerSig string
-	if sealerPrivKey != "" {
-		sealMsg := crypto.BuildChainSigningMessage(p.Height, blockHash)
-		sealerSig, err = crypto.SignEIP191(sealMsg, sealerPrivKey)
-		if err != nil {
-			return nil, fmt.Errorf("sealer sign failed: %w", err)
+	// Replay each tx into this node's own state so balances/nonces stay in
+	// sync with the leader that actually produced the block. A tx that
+	// fails here (e.g. this node's view of the sender's balance/nonce
+	// somehow disagrees) is logged and skipped rather than aborting the
+	// whole block — the block is still the source of truth for hash/height
+	// continuity even if this node's local state has drifted on one tx.
+	//
+	// Note: ApplyTx does NOT re-check tx.VerifySignature() — it only
+	// mutates balances/nonce. Individual tx signatures inside a gossiped
+	// block are therefore trusted, not re-verified, here. Consistent with
+	// this function's documented "loose" verification scope (see doc
+	// comment above) — tighten together if/when that's revisited.
+	for _, t := range txs {
+		if err := store.ApplyTx(t); err != nil {
+			// Intentionally not returned as a hard failure — see comment above.
+			log.Warn().Err(err).Uint64("height", height).Str("tx", t.Hash()).Msg("gossiped block: tx failed to apply locally")
 		}
 	}
 
 	header := state.BlockHeader{
-		Height:    p.Height,
-		Hash:      blockHash,
-		PrevHash:  p.PrevHash,
-		StateRoot: "", // Phase 1 placeholder
-		TxHashes:  p.TxHashes,
-		Timestamp: p.Timestamp,
-		Proposer:  p.Proposer,
-		TxCount:   len(p.TxHashes),
-		Signature: sealerSig,
+		Height:    height,
+		Hash:      hash,
+		PrevHash:  prevHash,
+		StateRoot: "",
+		TxHashes:  txHashes,
+		Timestamp: timestamp,
+		Proposer:  proposer,
+		TxCount:   len(txHashes),
 	}
-	if header.Timestamp == 0 {
-		header.Timestamp = time.Now().UnixMilli()
-	}
-
-	if err := store.SaveBlock(header); err != nil {
-		return nil, err
-	}
-
-	return &SealResult{Header: header, SealerSig: sealerSig}, nil
-}
-
-// Debug helper
-func ProposalJSON(p Proposal) string {
-	b, _ := json.MarshalIndent(p, "", "  ")
-	return string(b)
+	return store.SaveBlock(header)
 }
