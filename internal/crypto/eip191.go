@@ -111,3 +111,15 @@ func AddressFromPrivateKey(privateKeyHex string) (string, error) {
 func IsValidAddress(addr string) bool {
 	return common.IsHexAddress(addr)
 }
+
+// BuildMintMessage is what the mining/staking oracle signs to authorize a
+// claim_* mint from a supply bucket. Keep stable — wallet + Vercel oracle
+// must produce the exact same string.
+//
+//   EASTCHAIN_MINT|{bucket}|{beneficiary}|{amount}|{nonce}|{epoch_id}
+//
+// amount is human EAST (same unit as genesis bucket caps), not 6-decimal
+// subunits — see tx.ClaimMiningPayload and state.ApplyTx claim_mining branch.
+func BuildMintMessage(bucket, beneficiary string, amount int64, nonce uint64, epochID int64) string {
+	return fmt.Sprintf("EASTCHAIN_MINT|%s|%s|%d|%d|%d", bucket, beneficiary, amount, nonce, epochID)
+}

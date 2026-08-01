@@ -27,6 +27,7 @@ Lightweight validator for EASTCHAIN, designed for the **Railway free tier**.
 | Variable | Required | Description |
 |----------|----------|-------------|
 | `API_SECRET` | yes | Protects write endpoints |
+| `MINING_ORACLE_ADDRESS` | yes (for claim_mining) | EVM address of mining oracle; signs `EASTCHAIN_MINT\|...` |
 | `CHAIN_SIGNING_PRIVATE_KEY` | yes (for sealing) | `0x` + 32-byte hex (secp256k1) |
 | `CHAIN_SIGNING_ADDRESS` | recommended | Public address for the key above |
 | `NODE_ID` | no | default `validator-1` |
@@ -141,11 +142,41 @@ After deploy, call `GET /p2p` and copy a value from `listen`, then set that mult
 
 ## Still TODO (do not use real funds yet)
 
-- Transaction signature verification (`/tx` only checks API secret today)
-- Leader schedule on the sealer (currently trusts incoming proposals)
+- Leader schedule persistence + gossip of validator set
 - Real Merkle state root
 - Full block sync for peers that fall behind
 - DHT / mDNS discovery beyond manual bootstrap
+- claim_staking / campaign mint paths (only claim_mining is wired)
+- Unit unification: bucket caps are human EAST; balances are 6-decimal subunits
+
+## claim_mining (Phase 1 — on-chain mint from `mining` bucket)
+
+Replaces Neon `mintFromBucket('mining')` for the mining path.
+
+1. Set `MINING_ORACLE_ADDRESS` to the oracle EVM address (Vercel/service key).
+2. Oracle signs (ethers `personal_sign`):
+   ```
+   EASTCHAIN_MINT|mining|{beneficiary}|{amount}|{nonce}|{epoch_id}
+   ```
+   `amount` = human EAST (1 = 1 EAST), same unit as genesis bucket caps.
+3. Beneficiary signs the tx hash as usual (`EASTCHAIN_TX|{hash}`).
+4. `POST /tx` body example:
+   ```json
+   {
+     "type": "claim_mining",
+     "from": "0xBeneficiary...",
+     "amount": 10,
+     "nonce": 1,
+     "timestamp": 1730000000000,
+     "signature": "0x...user...",
+     "payload": {
+       "bucket": "mining",
+       "epoch_id": 42,
+       "oracle_signature": "0x...oracle..."
+     }
+   }
+   ```
+5. On seal: bucket.minted += amount; balance += amount * 1_000_000 (6 decimals).
 
 
 ## Mempool & leader election

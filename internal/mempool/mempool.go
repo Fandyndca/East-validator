@@ -87,6 +87,16 @@ func (m *Mempool) CheckTx(t *tx.Transaction) error {
 		if acc.PendingUnstake < t.Amount {
 			return fmt.Errorf("insufficient pending unstake")
 		}
+	case tx.TxClaimMining:
+		// ValidateBasic already checked oracle sig + payload.
+		// Ensure mining bucket still has room (human EAST units).
+		rem, err := m.store.BucketRemaining("mining")
+		if err != nil {
+			return fmt.Errorf("mining bucket: %w", err)
+		}
+		if t.Amount > rem {
+			return fmt.Errorf("mining bucket insufficient remaining: need %d, have %d", t.Amount, rem)
+		}
 	}
 	return nil
 }

@@ -179,26 +179,50 @@ func (s *Store) GetBucket(name string) (genesis.Bucket, error) {
 	return b, err
 }
 
-func (s *Store) MintFromBucket(name string, amount int64) error {
+// mintFromBucketTxn increments bucket.minted inside an existing Badger txn.
+// amount is in the same unit as genesis bucket caps (human EAST).
+func mintFromBucketTxn(txn *badger.Txn, name string, amount int64) error {
 	if amount <= 0 {
 		return fmt.Errorf("mint amount must be > 0")
 	}
+	item, err := txn.Get(bucketKey(name))
+	if err != nil {
+		return fmt.Errorf("bucket %s not found", name)
+	}
+	var b genesis.Bucket
+	if err := item.Value(func(val []byte) error { return json.Unmarshal(val, &b) }); err != nil {
+		return err
+	}
+	if b.Minted+amount > b.Cap {
+		return fmt.Errorf("bucket %s would exceed cap (%d/%d)", name, b.Minted+amount, b.Cap)
+	}
+	b.Minted += amount
+	val, err := json.Marshal(b)
+	if err != nil {
+		return err
+	}
+	return txn.Set(bucketKey(name), val)
+}
+
+// MintFromBucket is a standalone helper (admin/tests). Prefer ApplyTx claim_* paths
+// so mint + balance credit stay atomic.
+func (s *Store) MintFromBucket(name string, amount int64) error {
 	return s.db.Update(func(txn *badger.Txn) error {
-		item, err := txn.Get(bucketKey(name))
-		if err != nil {
-			return fmt.Errorf("bucket %s not found", name)
-		}
-		var b genesis.Bucket
-		if err := item.Value(func(val []byte) error { return json.Unmarshal(val, &b) }); err != nil {
-			return err
-		}
-		if b.Minted+amount > b.Cap {
-			return fmt.Errorf("bucket %s would exceed cap (%d/%d)", name, b.Minted+amount, b.Cap)
-		}
-		b.Minted += amount
-		val, _ := json.Marshal(b)
-		return txn.Set(bucketKey(name), val)
+		return mintFromBucketTxn(txn, name, amount)
 	})
+}
+
+// BucketRemaining returns cap - minted for a supply bucket (human EAST).
+func (s *Store) BucketRemaining(name string) (int64, error) {
+	b, err := s.GetBucket(name)
+	if err != nil {
+		return 0, err
+	}
+	rem := b.Cap - b.Minted
+	if rem < 0 {
+		return 0, nil
+	}
+	return rem, nil
 }
 
 func (s *Store) ListBuckets() ([]genesis.Bucket, error) {
@@ -274,6 +298,23 @@ func (s *Store) ApplyTx(t *tx.Transaction) error {
 			}
 			fromAcc.PendingUnstake -= t.Amount
 			fromAcc.Balance += t.Amount
+			fromAcc.Nonce = t.Nonce
+			return setAccountTxn(txn, t.From, fromAcc)
+
+		case tx.TxClaimMining:
+			// Amount is human EAST (matches genesis bucket caps). Credit balance in 6-dec subunits.
+			p, err := t.ParseClaimMiningPayload()
+			if err != nil {
+				return err
+			}
+			if err := mintFromBucketTxn(txn, p.Bucket, t.Amount); err != nil {
+				return err
+			}
+			credit := t.Amount * tx.SubunitsPerEAST
+			if t.Amount > 0 && credit/t.Amount != tx.SubunitsPerEAST {
+				return fmt.Errorf("claim_mining amount overflow converting to subunits")
+			}
+			fromAcc.Balance += credit
 			fromAcc.Nonce = t.Nonce
 			return setAccountTxn(txn, t.From, fromAcc)
 
