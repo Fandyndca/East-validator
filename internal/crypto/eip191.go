@@ -37,6 +37,14 @@ func BuildHeartbeatMessage(address, nodeID string, unixMs int64) string {
 	return fmt.Sprintf("EASTCHAIN_HEARTBEAT|%s|%s|%d", address, nodeID, unixMs)
 }
 
+// BuildValidatorRegisterMessage — what a node signs to prove it owns the
+// address it's registering as a block-producing validator. Without this,
+// anyone could register someone else's already-staked address into their
+// own leader schedule.
+func BuildValidatorRegisterMessage(address string, unixMs int64) string {
+	return fmt.Sprintf("EASTCHAIN_VALIDATOR_REGISTER|%s|%d", address, unixMs)
+}
+
 // VerifyEIP191 recovers the signer address from an EIP-191 personal_sign signature
 // and checks it equals expectedAddress (case-insensitive).
 func VerifyEIP191(message, signatureHex, expectedAddress string) (bool, error) {

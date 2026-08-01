@@ -71,6 +71,7 @@ func main() {
 
 	// Leader schedule (CometBFT-style round-robin when 2+ validators)
 	leader := consensus.NewLeaderSchedule(localAddr)
+	leader.SetStore(store)
 	if raw := os.Getenv("VALIDATORS"); raw != "" {
 		parts := strings.Split(raw, ",")
 		var addrs []string

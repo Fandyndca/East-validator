@@ -51,6 +51,7 @@ func New(cfg config.Config, store *state.Store, producer *consensus.Producer, p2
 	r.HandleFunc("/mempool/txs", s.handleMempoolTxs).Methods("GET")
 	r.HandleFunc("/consensus/propose", s.auth(s.handlePropose)).Methods("POST")
 	r.HandleFunc("/consensus/leader", s.handleLeader).Methods("GET")
+	r.HandleFunc("/validator/register", s.handleRegisterValidator).Methods("POST")
 	r.HandleFunc("/admin/validators", s.auth(s.handleSetValidators)).Methods("POST")
 	r.HandleFunc("/admin/validators", s.handleGetValidators).Methods("GET")
 	r.HandleFunc("/admin/seed", s.auth(s.handleSeed)).Methods("POST")
@@ -405,6 +406,71 @@ func (s *Server) handleGetValidators(w http.ResponseWriter, r *http.Request) {
 
 type setValidatorsRequest struct {
 	Validators []string `json:"validators"`
+}
+
+type validatorRegisterRequest struct {
+	Address   string `json:"address"`
+	UnixMs    int64  `json:"unix_ms"`
+	Signature string `json:"signature"` // EIP-191 over BuildValidatorRegisterMessage(address, unix_ms)
+}
+
+// handleRegisterValidator lets a node self-register as a block producer.
+// Public (no API_SECRET) — protected instead by requiring a signature that
+// proves ownership of the address, and by checking the address's live
+// staked balance meets the genesis minimum before accepting it. A node
+// whose stake later drops below minimum isn't removed here — it's simply
+// skipped from rotation on each lookup (see LeaderSchedule.eligibleValidatorsLocked).
+func (s *Server) handleRegisterValidator(w http.ResponseWriter, r *http.Request) {
+	if s.leader == nil {
+		http.Error(w, "leader schedule not enabled", http.StatusServiceUnavailable)
+		return
+	}
+	var req validatorRegisterRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid json", http.StatusBadRequest)
+		return
+	}
+	if req.Address == "" {
+		http.Error(w, "address required", http.StatusBadRequest)
+		return
+	}
+	if req.Signature == "" {
+		http.Error(w, "signature required", http.StatusBadRequest)
+		return
+	}
+	if req.UnixMs == 0 {
+		http.Error(w, "unix_ms required", http.StatusBadRequest)
+		return
+	}
+	age := time.Since(time.UnixMilli(req.UnixMs))
+	if age < -5*time.Minute || age > 5*time.Minute {
+		http.Error(w, "unix_ms outside 5-minute freshness window", http.StatusBadRequest)
+		return
+	}
+	msg := crypto.BuildValidatorRegisterMessage(req.Address, req.UnixMs)
+	ok, err := crypto.VerifyEIP191(msg, req.Signature, req.Address)
+	if err != nil || !ok {
+		http.Error(w, "invalid signature", http.StatusUnauthorized)
+		return
+	}
+
+	eligible, err := s.leader.IsEligible(req.Address)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if !eligible {
+		http.Error(w, "address does not meet minimum validator stake", http.StatusForbidden)
+		return
+	}
+
+	s.leader.AddValidator(req.Address)
+	h, _ := s.store.GetLatestHeight()
+	log.Info().Str("address", req.Address).Msg("validator registered")
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":     true,
+		"leader": s.leader.Stats(h + 1),
+	})
 }
 
 func (s *Server) handleSetValidators(w http.ResponseWriter, r *http.Request) {
