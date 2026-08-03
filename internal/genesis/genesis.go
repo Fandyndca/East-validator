@@ -66,8 +66,8 @@ func Default() Genesis {
 		GenesisTime:       time.Now().UnixMilli(),
 		TotalMaxSupply:    TotalMaxSupply,
 		Buckets:           append([]Bucket(nil), DefaultBuckets...),
-		MinValidatorStake: 1_000_000_000, // 1,000 EAST at 6 decimals
-		MinFullnodeStake:  100_000_000,   //   100 EAST at 6 decimals
+		MinValidatorStake: 0, // temporary: 0 for easy multi-validator setup
+		MinFullnodeStake:  0,             // temporary: 0
 	}
 }
 
@@ -94,11 +94,13 @@ func (g *Genesis) Validate() error {
 	if g.TotalMaxSupply != TotalMaxSupply {
 		return fmt.Errorf("total_max_supply must be %d (got %d)", TotalMaxSupply, g.TotalMaxSupply)
 	}
-	if g.MinValidatorStake <= 0 {
-		g.MinValidatorStake = 1_000_000_000 // 1,000 EAST at 6 decimals
+	// Allow 0 for easy validator setup (no admin seed stake required).
+	// Raise in genesis.json for production.
+	if g.MinValidatorStake < 0 {
+		g.MinValidatorStake = 0
 	}
-	if g.MinFullnodeStake <= 0 {
-		g.MinFullnodeStake = 100_000_000 // 100 EAST at 6 decimals
+	if g.MinFullnodeStake < 0 {
+		g.MinFullnodeStake = 0
 	}
 	if g.MinFullnodeStake > g.MinValidatorStake {
 		return fmt.Errorf("min_fullnode_stake (%d) cannot exceed min_validator_stake (%d)", g.MinFullnodeStake, g.MinValidatorStake)

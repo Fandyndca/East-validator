@@ -176,8 +176,8 @@ Hard-coded and validated at boot:
 | founder | 50,000,000 |
 | **TOTAL** | **1,000,000,000** |
 
-Min validator stake: **100 EAST**  
-Min fullnode stake: **10 EAST**
+Min validator stake: **0** (temporary; was 1000 EAST subunits scale)  
+Min fullnode stake: **0** (temporary)
 
 ## Deploy on Railway
 
