@@ -64,9 +64,9 @@ type BFTConfig struct {
 
 func DefaultBFTConfig() BFTConfig {
 	return BFTConfig{
-		ProposeTimeout:    3 * time.Second,
-		PrevoteTimeout:    2 * time.Second,
-		PrecommitTimeout:  2 * time.Second,
+		ProposeTimeout:    5 * time.Second,
+		PrevoteTimeout:    5 * time.Second,
+		PrecommitTimeout:  5 * time.Second,
 		RoundTimeoutDelta: 1 * time.Second,
 		MinBlockInterval:  120 * time.Second,
 		Enabled:           true,
@@ -417,6 +417,9 @@ func (e *BFTEngine) waitBlockInterval() {
 }
 
 func (e *BFTEngine) runPropose(height uint64, round int32) {
+	// Pace block production (multi-validator path was skipping StepCommit wait).
+	e.waitBlockInterval()
+
 	e.mu.Lock()
 	if e.step != StepNewHeight && e.step != StepPropose {
 		e.mu.Unlock()
@@ -739,6 +742,7 @@ func (e *BFTEngine) commitLocked(blockHash string, votes []Vote) {
 		_ = e.store.SaveBlock(header)
 		e.markCommitted()
 		applied = result.Txs
+		// Stay on StepCommit so the engine loop can also pace; advance after gossip below.
 	} else {
 		// Should not happen often — we committed a hash we never saw as proposal
 		log.Error().Str("hash", blockHash).Msg("BFT: commit without matching proposal — skipping apply")
@@ -774,6 +778,11 @@ func (e *BFTEngine) commitLocked(blockHash string, votes []Vote) {
 		e.onCommit(header, applied)
 	}
 
+	// Release lock while sleeping so vote handlers are not blocked for the full interval.
+	// Caller (tryFinalizePrecommitsLocked) holds e.mu — unlock/lock around the wait.
+	e.mu.Unlock()
+	e.waitBlockInterval()
+	e.mu.Lock()
 	e.advanceHeightLocked()
 }
 

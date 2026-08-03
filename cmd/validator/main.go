@@ -132,6 +132,22 @@ func main() {
 		if bftCfg.MinBlockInterval <= 0 {
 			bftCfg.MinBlockInterval = 120 * time.Second
 		}
+		// Optional overrides (seconds). Defaults: propose/prevote/precommit = 5.
+		if v := os.Getenv("BFT_PROPOSE_TIMEOUT_SEC"); v != "" {
+			if n, err := time.ParseDuration(v + "s"); err == nil && n > 0 {
+				bftCfg.ProposeTimeout = n
+			}
+		}
+		if v := os.Getenv("BFT_PREVOTE_TIMEOUT_SEC"); v != "" {
+			if n, err := time.ParseDuration(v + "s"); err == nil && n > 0 {
+				bftCfg.PrevoteTimeout = n
+			}
+		}
+		if v := os.Getenv("BFT_PRECOMMIT_TIMEOUT_SEC"); v != "" {
+			if n, err := time.ParseDuration(v + "s"); err == nil && n > 0 {
+				bftCfg.PrecommitTimeout = n
+			}
+		}
 		bftCfg.Enabled = true
 		bft = consensus.NewBFTEngine(store, leader, bftCfg)
 		bft.SetMempool(pool)

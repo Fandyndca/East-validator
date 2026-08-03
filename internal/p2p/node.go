@@ -125,17 +125,7 @@ type Config struct {
 	// ConnLow / ConnHigh bound the connection manager (public DoS protection).
 	ConnLow  int
 	ConnHigh int
-	// AnnounceAddr, if set, is the ONLY multiaddr this node advertises to
-	// peers (e.g. "/dns4/autorack.proxy.rlwy.net/tcp/24514"). Without this,
-	// libp2p's default AddrsFactory announces every address it can see
-	// itself listening on — which on platforms like Railway includes the
-	// container's private internal IP (e.g. 10.x.x.x). Peers that learn
-	// that private IP via Identify/DHT will store it in their peerstore
-	// and eventually try to redial it, which always times out since it's
-	// unreachable from outside Railway's internal network — silently
-	// breaking a connection that was working fine over the real public
-	// TCP-proxy address. Set this to the public TCP proxy address in any
-	// environment where the node isn't reachable at its own listen address.
+	// AnnounceAddr: public multiaddr only (Railway TCP proxy). See P2P_ANNOUNCE_ADDR.
 	AnnounceAddr string
 }
 
@@ -218,15 +208,6 @@ func New(cfg Config) (*Node, error) {
 		return nil, err
 	}
 
-	var announceAddr multiaddr.Multiaddr
-	if cfg.AnnounceAddr != "" {
-		announceAddr, err = multiaddr.NewMultiaddr(cfg.AnnounceAddr)
-		if err != nil {
-			cancel()
-			return nil, fmt.Errorf("invalid P2P_ANNOUNCE_ADDR %q: %w", cfg.AnnounceAddr, err)
-		}
-	}
-
 	// Connection manager: prune excess peers so a public node cannot be
 	// connection-flooded into OOM / FD exhaustion.
 	if cfg.ConnLow <= 0 {
@@ -241,6 +222,15 @@ func New(cfg Config) (*Node, error) {
 		return nil, fmt.Errorf("connmgr: %w", err)
 	}
 
+	var announceAddr multiaddr.Multiaddr
+	if cfg.AnnounceAddr != "" {
+		announceAddr, err = multiaddr.NewMultiaddr(cfg.AnnounceAddr)
+		if err != nil {
+			cancel()
+			return nil, fmt.Errorf("invalid P2P_ANNOUNCE_ADDR %q: %w", cfg.AnnounceAddr, err)
+		}
+	}
+
 	h, err := libp2p.New(
 		libp2p.Identity(priv),
 		libp2p.ListenAddrs(listen),
@@ -252,19 +242,11 @@ func New(cfg Config) (*Node, error) {
 		libp2p.EnableNATService(),
 		libp2p.EnableRelay(),
 		libp2p.EnableHolePunching(),
-		libp2p.NATPortMap(), // UPnP / NAT-PMP when available
+		libp2p.NATPortMap(),
 		libp2p.AddrsFactory(func(addrs []multiaddr.Multiaddr) []multiaddr.Multiaddr {
-			// When AnnounceAddr is configured, it's the ONLY address this
-			// node tells peers about — never the auto-discovered private
-			// container IP. See the AnnounceAddr field doc comment for why.
 			if announceAddr != nil {
 				return []multiaddr.Multiaddr{announceAddr}
 			}
-			// No override configured (e.g. local/LAN dev setups where the
-			// listen address genuinely is reachable) — pass through
-			// unchanged, matching libp2p's own default behavior. Returning
-			// nil here would wipe out every address the host announces,
-			// not "fall back to defaults".
 			return addrs
 		}),
 	)

@@ -94,8 +94,8 @@ func (g *Genesis) Validate() error {
 	if g.TotalMaxSupply != TotalMaxSupply {
 		return fmt.Errorf("total_max_supply must be %d (got %d)", TotalMaxSupply, g.TotalMaxSupply)
 	}
-	// Allow 0 for easy validator setup (no admin seed stake required).
-	// Raise in genesis.json for production.
+	// Allow 0 for dev / easy validator setup (no seed stake required).
+	// Production can set min_validator_stake > 0 in genesis.json.
 	if g.MinValidatorStake < 0 {
 		g.MinValidatorStake = 0
 	}
