@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -403,13 +404,39 @@ func (s *Store) PruneOldBlocks(keep int) error {
 	})
 }
 
+// SeedBalance sets only free balance (legacy). Prefer SeedAccount for migrations.
 func (s *Store) SeedBalance(addr string, balance int64) error {
+	return s.SeedAccount(addr, balance, 0, 0, "balance_only")
+}
+
+// SeedAccount writes balance / staked / pending_unstake in 6-decimal subunits.
+// mode: "overwrite" | "merge_max" | "balance_only"
+// Nonce is never modified (safe for in-flight txs).
+func (s *Store) SeedAccount(addr string, balance, staked, pendingUnstake int64, mode string) error {
 	return s.db.Update(func(txn *badger.Txn) error {
 		acc, err := getAccountTxn(txn, addr)
 		if err != nil {
 			return err
 		}
-		acc.Balance = balance
+		m := strings.ToLower(strings.TrimSpace(mode))
+		switch m {
+		case "balance_only", "balance":
+			acc.Balance = balance
+		case "merge_max", "merge":
+			if balance > acc.Balance {
+				acc.Balance = balance
+			}
+			if staked > acc.Staked {
+				acc.Staked = staked
+			}
+			if pendingUnstake > acc.PendingUnstake {
+				acc.PendingUnstake = pendingUnstake
+			}
+		default: // overwrite / set / empty
+			acc.Balance = balance
+			acc.Staked = staked
+			acc.PendingUnstake = pendingUnstake
+		}
 		return setAccountTxn(txn, addr, acc)
 	})
 }

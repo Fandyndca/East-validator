@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/gorilla/mux"
@@ -257,8 +258,11 @@ func (s *Server) handlePropose(w http.ResponseWriter, r *http.Request) {
 }
 
 type seedRequest struct {
-	Address string `json:"address"`
-	Balance int64  `json:"balance"`
+	Address        string `json:"address"`
+	Balance        int64  `json:"balance"`         // subunits
+	Staked         int64  `json:"staked"`          // subunits
+	PendingUnstake int64  `json:"pending_unstake"` // subunits
+	Mode           string `json:"mode,omitempty"`  // overwrite | merge_max | balance_only
 }
 
 func (s *Server) handleSeed(w http.ResponseWriter, r *http.Request) {
@@ -271,11 +275,24 @@ func (s *Server) handleSeed(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "address required", http.StatusBadRequest)
 		return
 	}
-	if err := s.store.SeedBalance(req.Address, req.Balance); err != nil {
+	mode := strings.TrimSpace(req.Mode)
+	if mode == "" {
+		mode = "overwrite"
+	}
+	if err := s.store.SeedAccount(req.Address, req.Balance, req.Staked, req.PendingUnstake, mode); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":      true,
+		"address": strings.ToLower(req.Address),
+		"mode":    mode,
+		"seeded": map[string]int64{
+			"balance":         req.Balance,
+			"staked":          req.Staked,
+			"pending_unstake": req.PendingUnstake,
+		},
+	})
 }
 
 func (s *Server) handlePrune(w http.ResponseWriter, r *http.Request) {
