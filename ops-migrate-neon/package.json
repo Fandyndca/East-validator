@@ -1,0 +1,14 @@
+{
+  "name": "east-migrate-neon-to-chain",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Migrate identity.users balance/staked/pending_unstake from Neon to east-validator /admin/seed",
+  "scripts": {
+    "dry-run": "node migrate-neon-stake-to-chain.mjs --dry-run",
+    "execute": "node migrate-neon-stake-to-chain.mjs --execute --mode=merge_max"
+  },
+  "dependencies": {
+    "pg": "^8.13.0"
+  }
+}

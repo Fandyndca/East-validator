@@ -131,7 +131,11 @@ func (s *Store) MinValidatorStake() int64    { return s.minValidatorStake }
 func (s *Store) ChainSigningAddress() string { return s.chainSigningAddr }
 func (s *Store) NumericChainID() int64       { return s.numericChainID }
 
-func accountKey(addr string) []byte { return []byte("acc:" + addr) }
+func normalizeAddr(addr string) string {
+	return strings.ToLower(strings.TrimSpace(addr))
+}
+
+func accountKey(addr string) []byte { return []byte("acc:" + normalizeAddr(addr)) }
 func bucketKey(name string) []byte  { return []byte("bucket:" + name) }
 func blockKey(height uint64) []byte { return []byte(fmt.Sprintf("blk:%020d", height)) }
 func metaKey(key string) []byte     { return []byte("meta:" + key) }
@@ -153,9 +157,17 @@ func (s *Store) GetAccount(addr string) (Account, error) {
 
 func getAccountTxn(txn *badger.Txn, addr string) (Account, error) {
 	var acc Account
-	item, err := txn.Get(accountKey(addr))
+	norm := normalizeAddr(addr)
+	item, err := txn.Get(accountKey(norm))
 	if err == badger.ErrKeyNotFound {
-		return acc, nil
+		// Legacy keys may have been stored with mixed-case EIP-55 address.
+		// Fall back to exact key, then callers using setAccountTxn will rewrite to lowercase.
+		if norm != addr {
+			item, err = txn.Get([]byte("acc:" + addr))
+		}
+		if err == badger.ErrKeyNotFound {
+			return acc, nil
+		}
 	}
 	if err != nil {
 		return acc, err
